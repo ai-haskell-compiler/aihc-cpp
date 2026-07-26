@@ -1,0 +1,34 @@
+name: GHC Compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build with GHC ${{ matrix.ghc }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ghc: [9.8.4, 9.10.3, 9.12.4, 9.14.1]
+    steps:
+      - uses: actions/checkout@v7
+      - id: setup-haskell
+        uses: haskell-actions/setup@v2.11.0
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: 3.16.0.0
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ${{ steps.setup-haskell.outputs.cabal-store }}
+            dist-newstyle
+          key: ghc-compat-${{ runner.os }}-${{ matrix.ghc }}-${{ hashFiles('cabal.project.ghc-compat', '*.cabal') }}
+      - run: cabal update
+      - run: cabal build -v1 all --project-file=cabal.project.ghc-compat --disable-optimization

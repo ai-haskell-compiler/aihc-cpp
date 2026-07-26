@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0.3] - 2026-07-26
+
+### Changed
+
+- Moved development to the standalone
+  [`ai-haskell-compiler/aihc-cpp`](https://github.com/ai-haskell-compiler/aihc-cpp)
+  repository, including the full test and compatibility CI configuration.
+
 ## [1.0.0.2] - 2026-05-27
 
 ### Fixed

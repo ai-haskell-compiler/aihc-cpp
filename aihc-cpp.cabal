@@ -1,6 +1,6 @@
 cabal-version: 3.8
 name: aihc-cpp
-version: 1.0.0.2
+version: 1.0.0.3
 build-type: Simple
 license: Unlicense
 license-file: LICENSE
@@ -19,13 +19,12 @@ description:
   package provides deterministic preprocessing with include continuations and
   oracle-backed tests against cpphs.
 
-homepage: https://github.com/ai-haskell-compiler/aihc/tree/main/components/aihc-cpp
-bug-reports: https://github.com/ai-haskell-compiler/aihc/issues
+homepage: https://github.com/ai-haskell-compiler/aihc-cpp
+bug-reports: https://github.com/ai-haskell-compiler/aihc-cpp/issues
 
 source-repository head
   type: git
-  location: https://github.com/ai-haskell-compiler/aihc.git
-  subdir: components/aihc-cpp
+  location: https://github.com/ai-haskell-compiler/aihc-cpp.git
 
 library
   exposed-modules:
