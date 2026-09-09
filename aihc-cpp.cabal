@@ -6,6 +6,7 @@ license: Unlicense
 license-file: LICENSE
 extra-doc-files: CHANGELOG.md
 extra-source-files:
+  bench/include/*.h
   test/Test/Fixtures/progress/*.hs
   test/Test/Fixtures/progress/*.tsv
   test/Test/Fixtures/progress/includes/*.inc

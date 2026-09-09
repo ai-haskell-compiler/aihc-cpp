@@ -60,8 +60,9 @@ import Language.Preprocessor.Cpphs
   )
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.Environment (lookupEnv)
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (splitDirectories, takeDirectory, (</>))
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stdout)
+import System.IO.Unsafe (unsafePerformIO)
 import Test.Tasty.Bench (Benchmark, bench, bgroup, defaultMain, nfIO)
 
 -- | Which corpus to benchmark.
@@ -187,29 +188,19 @@ data Outcome = Outcome
 --
 -- The two parenthesised entries are not competitors. @(read only)@ is the file
 -- read every tool pays for; @(read + String)@ adds the 'String' conversion that
--- cpphs\'s API demands. Subtract the matching baseline from a tool to compare
+-- cpphs's API demands. Subtract the matching baseline from a tool to compare
 -- preprocessing rather than plumbing.
 --
 -- Each forces its output completely and returns the length, so that no tool
 -- benefits from leaving a lazy structure unevaluated and all three are charged
--- for producing the whole result.
---
--- Each also converts the input into the shape its own API demands, inside the
--- timed region. cpphs takes a 'String', and holding the whole corpus as one
--- costs about seventy bytes per source character once the collector\'s copying
--- space is counted — on a 4MB corpus that was 290MB of the 417MB peak, and it
--- was the reason the corpus had to stay small. Doing it per iteration instead
--- keeps one module\'s worth live rather than the whole corpus.
---
--- That does charge cpphs for marshalling that is not preprocessing, so the cost
--- is measured too: the @(input marshalling)@ entry does the 'String' conversion
--- and nothing else. Subtract it from cpphs to recover a like-for-like number.
+-- for producing the whole result, and each converts the input into the shape
+-- its own API demands inside the timed region.
 tools :: [(String, FilePath -> Prepared -> IO Outcome)]
 tools =
   [ ( "aihc-cpp",
-      \_ p -> do
+      \root p -> do
         source <- BS.readFile (prepPath p)
-        result <- runAihc (prepPath p) source
+        result <- runAihc (searchPath root p) (prepPath p) source
         -- aihc-cpp reports a bad directive or an unresolvable include as a
         -- diagnostic and still returns output; hpp and cpphs throw. Reporting
         -- these separately from crashes keeps that difference visible instead
@@ -220,13 +211,13 @@ tools =
     ( "hpp",
       \root p -> do
         source <- BS.readFile (prepPath p)
-        out <- hpp root p (BS8.lines source)
+        out <- hpp (searchPath root p) p (BS8.lines source)
         flip Outcome False . sum . map BS.length <$> evaluate (force out)
     ),
     ( "cpphs",
       \root p -> do
         source <- BS.readFile (prepPath p)
-        out <- runCpphs (cpphsOptions root) (prepPath p) (BS8.unpack source)
+        out <- runCpphs (cpphsOptions (searchPath root p)) (prepPath p) (BS8.unpack source)
         flip Outcome False . length <$> evaluate (force out)
     ),
     ( "(read only)",
@@ -253,6 +244,7 @@ main = do
         | (c, p) <- zip corpusCases prepared
         ]
     RealWorld root -> do
+      warnMissingStubs
       found <- listHsFiles root
       full <- lookupEnv "AIHC_CPP_BENCH_SWEEP"
       selected <- lookupEnv "AIHC_CPP_BENCH_TOOLS"
@@ -305,8 +297,8 @@ fullSweep root chosen prepared = do
     one corpusBytes (name, run) = do
       start <- getMonotonicTime
       -- Folded strictly, keeping only counters and the first few failures.
-      -- Retaining every outcome kept each failure\'s exception alive, and with
-      -- it whatever the exception\'s message had captured.
+      -- Retaining every outcome kept each failure's exception alive, and with
+      -- it whatever the exception's message had captured.
       tally <- foldM (step run) (Tally 0 0 0 0 []) prepared
       elapsed <- subtract start <$> getMonotonicTime
       let mib = fromIntegral corpusBytes / 1048576 :: Double
@@ -341,7 +333,7 @@ fullSweep root chosen prepared = do
        in show whole <> "." <> pad0 places (show frac)
     pad0 n str = replicate (n - length str) '0' <> str
 
--- | Running counts for one tool\'s pass over the corpus.
+-- | Running counts for one tool's pass over the corpus.
 data Tally = Tally
   { tallyOk :: !Int,
     tallyErrored :: !Int,
@@ -451,59 +443,111 @@ reportOne root (c, p) = do
     )
 
 -- | Run hpp over the preloaded lines, returning its output chunks.
-hpp :: FilePath -> Prepared -> [BS.ByteString] -> IO [BS.ByteString]
-hpp root p inputLines = do
+hpp :: [FilePath] -> Prepared -> [BS.ByteString] -> IO [BS.ByteString]
+hpp dirs p inputLines = do
   result <-
     runExceptT
       ( Hpp.runHpp
-          (Hpp.initHppState (hppConfig root (prepPath p)) mempty)
+          (Hpp.initHppState (hppConfig dirs (prepPath p)) mempty)
           (Hpp.preprocess inputLines)
       )
   case result of
     Left err -> error ("hpp failed on " <> prepPath p <> ": " <> show err)
     Right (out, _) -> pure (Hpp.hppOutput out)
 
-hppConfig :: FilePath -> FilePath -> HppConfig.Config
-hppConfig root path =
+hppConfig :: [FilePath] -> FilePath -> HppConfig.Config
+hppConfig dirs path =
   fromMaybe
     (error "hpp configuration incomplete")
     ( HppConfig.realizeConfig
         HppConfig.defaultConfigF
           { HppConfig.curFileNameF = Just path,
-            HppConfig.includePathsF = Just [root, takeDirectory path]
+            HppConfig.includePathsF = Just (takeDirectory path : dirs)
           }
     )
 
 -- | The same cpphs configuration the correctness oracle in @test/@ uses, so the
 -- implementation being timed is the one already being compared against.
-cpphsOptions :: FilePath -> CpphsOptions
-cpphsOptions root =
+cpphsOptions :: [FilePath] -> CpphsOptions
+cpphsOptions dirs =
   defaultCpphsOptions
     { boolopts = (boolopts defaultCpphsOptions) {stripC89 = True, warnings = False},
-      includes = [root]
+      includes = dirs
     }
 
--- | Preprocess a file whose contents are already in memory, resolving
--- @#include@ directives from disk as they are requested.
+-- | Where to look for an @#include@ target, beyond the including file's own
+-- directory.
+--
+-- A real build passes include directories that a bare source tree does not
+-- have: the RTS headers GHC ships (stubbed under @bench\/include@) and the
+-- package's own @include@ directory, which Cabal adds from @include-dirs@.
+-- Without them around a hundred modules per snapshot fail to resolve
+-- @MachDeps.h@ alone, and since the three tools disagree about whether an
+-- unresolvable include is fatal, the failure counts end up describing include
+-- resolution rather than the preprocessors.
+searchPath :: FilePath -> Prepared -> [FilePath]
+searchPath root p = [stubIncludes, packageDir </> "include", packageDir, root]
+  where
+    -- Corpus layout is <root>/<package-version>/..., so the package directory
+    -- is the first component below the root.
+    packageDir = case stripPrefixDir root (prepPath p) of
+      Just (component : _) -> root </> component
+      _ -> takeDirectory (prepPath p)
+
+-- | Directory holding stand-ins for headers a real build would supply.
+--
+-- Relative to the package root, which is where @cabal bench@ runs. Overridable
+-- so the binary can be run from elsewhere; 'warnMissingStubs' says so if it is
+-- not found, because the symptom otherwise is a quietly worse failure count
+-- rather than an error.
+stubIncludes :: FilePath
+stubIncludes = unsafeStubIncludes
+
+{-# NOINLINE unsafeStubIncludes #-}
+unsafeStubIncludes :: FilePath
+unsafeStubIncludes =
+  unsafePerformIO (fromMaybe ("bench" </> "include") <$> lookupEnv "AIHC_CPP_BENCH_INCLUDE")
+
+-- | Say so if the stub headers are not where they are expected.
+warnMissingStubs :: IO ()
+warnMissingStubs = do
+  present <- doesDirectoryExist stubIncludes
+  if present
+    then putStrLn ("stub headers: " <> stubIncludes)
+    else
+      putStrLn
+        ( "warning: no stub headers at "
+            <> stubIncludes
+            <> " (set AIHC_CPP_BENCH_INCLUDE); modules including MachDeps.h will not resolve"
+        )
+
+stripPrefixDir :: FilePath -> FilePath -> Maybe [FilePath]
+stripPrefixDir root path = go (splitDirectories root) (splitDirectories path)
+  where
+    go [] rest = Just rest
+    go (r : rs) (p : ps) | r == p = go rs ps
+    go _ _ = Nothing
+
+-- | Preprocess a file whose contents are already in memory, searching the given
+-- directories for @#include@ targets as they are requested.
 --
 -- Includes are read from disk rather than preloaded because that is what cpphs
 -- and hpp do: they take the entry file's contents and go to the file system for
 -- the rest. Preloading them for aihc-cpp alone would hand it an advantage the
 -- other two cannot have.
-runAihc :: FilePath -> BS.ByteString -> IO Result
-runAihc path source = go (preprocess (defaultConfig {configInputFile = path}) source)
+runAihc :: [FilePath] -> FilePath -> BS.ByteString -> IO Result
+runAihc dirs path source =
+  go (preprocess (defaultConfig {configInputFile = path}) source)
   where
     go (Done r) = pure r
     go (NeedInclude req k) = do
-      let target = resolveInclude path req
-      exists <- doesFileExist target
-      contents <- if exists then Just <$> BS.readFile target else pure Nothing
+      contents <- firstExisting (candidates req)
       go (k contents)
-
--- | Resolve an include relative to the file that requested it, falling back to
--- the directory of the entry file.
-resolveInclude :: FilePath -> IncludeRequest -> FilePath
-resolveInclude rootPath req = baseDir </> includePath req
-  where
-    fromDir = takeDirectory (includeFrom req)
-    baseDir = if null fromDir then takeDirectory rootPath else fromDir
+    candidates req = [dir </> includePath req | dir <- includeDirs req]
+    includeDirs req =
+      let fromDir = takeDirectory (includeFrom req)
+       in (if null fromDir then takeDirectory path else fromDir) : dirs
+    firstExisting [] = pure Nothing
+    firstExisting (candidate : rest) = do
+      exists <- doesFileExist candidate
+      if exists then Just <$> BS.readFile candidate else firstExisting rest

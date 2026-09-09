@@ -51,28 +51,45 @@ modules, 71 MiB of source. On an M-series Mac with GHC 9.12.4:
 
 | tool | ok | errored | crashed | seconds | MiB out | MiB/s |
 | --- | --- | --- | --- | --- | --- | --- |
-| aihc-cpp | 5359 | 443 | **0** | 3.10 | 69.5 | 23.2 |
-| cpphs | 5767 | 0 | 35 | 4.46 | 69.1 | 16.1 |
-| hpp | 5233 | 0 | 569 | 32.47 | 57.8 | 2.2 |
+| aihc-cpp | 5534 | 268 | **0** | 3.42 | 69.8 | 21.0 |
+| cpphs | 5772 | 0 | 30 | 4.35 | 69.4 | 16.5 |
+| hpp | 5393 | 0 | 409 | 33.93 | 60.4 | 2.1 |
 | *(read only)* | 5802 | — | — | *0.14* | — | — |
-| *(read + String)* | 5802 | — | — | *0.73* | — | — |
+| *(read + String)* | 5802 | — | — | *0.70* | — | — |
 
-Subtract each tool's input baseline for a like-for-like figure: aihc-cpp 2.96 s
-against cpphs 3.73 s, so **aihc-cpp is about 1.26x faster**, and hpp is an order
+Subtract each tool's input baseline for a like-for-like figure: aihc-cpp 3.28 s
+against cpphs 3.65 s, so **aihc-cpp is about 1.1x faster**, and hpp is an order
 of magnitude behind both. aihc-cpp is the only one that gets through all 5,802
 modules without crashing.
 
 The three columns are not interchangeable:
 
 - **errored** — the tool produced output but reported a problem in the source.
-  Only aihc-cpp distinguishes this; the other two throw. Nearly all 443 are
-  `missing include: MachDeps.h` or similar: headers a real build generates and
-  a bare source tree does not have. cpphs ignores an unresolvable include
-  silently, so this is a difference of policy, not of capability.
-- **crashed** — the tool produced nothing. cpphs's 35 are almost all genuine
-  `#error` directives it is right to stop on. hpp's 569 are mostly missing
+  Only aihc-cpp distinguishes this; the other two throw. Most of the 268 are
+  still unresolvable includes, so this is a difference of policy rather than of
+  capability: cpphs ignores an unresolvable include silently.
+- **crashed** — the tool produced nothing. cpphs's 30 are almost all genuine
+  `#error` directives it is right to stop on. hpp's 409 are mostly missing
   includes, which it treats as fatal, and that is also why it emits the least
   output.
+
+#### Headers a real build would supply
+
+Every tool searches `bench/include`, the package's own `include` directory (what
+Cabal passes from `include-dirs`), and the package root, as well as the
+including file's own directory.
+
+`bench/include` holds stand-ins for headers GHC supplies from the RTS that a
+bare source tree does not have. `MachDeps.h` is much the most common — about a
+hundred modules per snapshot include it — so it is stubbed there, written from
+the macro names GHC's header defines rather than copied from it, with
+conventional 64-bit values. Nothing is compiled, only preprocessed, so the
+values only need to make arithmetic in `#if` conditions evaluate. Supplying it
+took aihc-cpp's error count from 443 to 268 and hpp's crashes from 569 to 409.
+
+The remaining unresolved includes are mostly `cabal_macros.h` (generated
+per-package by Cabal, so a stub would be wrong rather than merely inexact) and
+package-local headers kept in directories Cabal is told about individually.
 
 #### Sampled benchmark
 
