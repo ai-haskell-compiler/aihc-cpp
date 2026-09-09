@@ -167,28 +167,6 @@ usesCpp = any isDirective . BS8.lines
     directives =
       ["if", "ifdef", "ifndef", "elif", "else", "endif", "define", "undef", "include"]
 
--- | Macro definitions prepended to every module, or empty.
---
--- A real build does not wait for a module to include cabal_macros.h: Cabal
--- passes it with @-optP-include@, so MIN_VERSION_ macros are defined for every
--- module whether or not it mentions the file. Most of the corpus uses them that
--- way, which is why putting the generated header on the include path alone
--- barely moved the numbers.
---
--- Prepending is not free, though, and it is charged to all three tools equally:
--- see the @(read only)@ row and the note in the README about how large a
--- prelude the snapshot-wide file makes.
-{-# NOINLINE preludeBytes #-}
-preludeBytes :: BS.ByteString
-preludeBytes =
-  unsafePerformIO $ do
-    configured <- lookupEnv "AIHC_CPP_BENCH_PRELUDE"
-    case configured of
-      Nothing -> pure BS.empty
-      Just file -> do
-        exists <- doesFileExist file
-        if exists then (<> "\n") <$> BS.readFile file else pure BS.empty
-
 -- | An input, identified by path.
 --
 -- Nothing is preloaded. Each tool reads the file inside the timed region and
@@ -221,7 +199,7 @@ tools :: [(String, FilePath -> Prepared -> IO Outcome)]
 tools =
   [ ( "aihc-cpp",
       \root p -> do
-        source <- withPrelude <$> BS.readFile (prepPath p)
+        source <- BS.readFile (prepPath p)
         result <- runAihc (searchPath root p) (prepPath p) source
         -- aihc-cpp reports a bad directive or an unresolvable include as a
         -- diagnostic and still returns output; hpp and cpphs throw. Reporting
@@ -232,22 +210,22 @@ tools =
     ),
     ( "hpp",
       \root p -> do
-        source <- withPrelude <$> BS.readFile (prepPath p)
+        source <- BS.readFile (prepPath p)
         out <- hpp (searchPath root p) p (BS8.lines source)
         flip Outcome False . sum . map BS.length <$> evaluate (force out)
     ),
     ( "cpphs",
       \root p -> do
-        source <- withPrelude <$> BS.readFile (prepPath p)
+        source <- BS.readFile (prepPath p)
         out <- runCpphs (cpphsOptions (searchPath root p)) (prepPath p) (BS8.unpack source)
         flip Outcome False . length <$> evaluate (force out)
     ),
     ( "(read only)",
-      \_ p -> flip Outcome False . BS.length . withPrelude <$> BS.readFile (prepPath p)
+      \_ p -> flip Outcome False . BS.length <$> BS.readFile (prepPath p)
     ),
     ( "(read + String)",
       \_ p -> do
-        source <- withPrelude <$> BS.readFile (prepPath p)
+        source <- BS.readFile (prepPath p)
         flip Outcome False . length <$> evaluate (force (BS8.unpack source))
     )
   ]
@@ -411,12 +389,6 @@ tryTool act = do
 prepare :: FilePath -> IO Prepared
 prepare = pure . Prepared
 
--- | Prepend the macro prelude, if one was configured.
-withPrelude :: BS.ByteString -> BS.ByteString
-withPrelude source
-  | BS.null preludeBytes = source
-  | otherwise = preludeBytes <> source
-
 -- | Describe the discovered corpus, and how much of it each tool can handle.
 reportCorpus :: FilePath -> Int -> [Prepared] -> IO ()
 reportCorpus root found prepared = do
@@ -526,9 +498,7 @@ searchPath root p = stubIncludes <> [packageDir </> "include", packageDir, root]
 --
 -- Defaults to @bench\/include@, relative to the package root where @cabal
 -- bench@ runs. @AIHC_CPP_BENCH_INCLUDE@ overrides it with a colon-separated
--- list, which is how the generated @cabal_macros.h@ is added: that one is
--- snapshot-specific, so it lives in the download cache rather than the
--- repository.
+-- list, so a corpus that needs headers of its own can add a directory.
 stubIncludes :: [FilePath]
 stubIncludes = unsafeStubIncludes
 
@@ -544,11 +514,7 @@ unsafeStubIncludes =
 -- modules do not resolve their includes, which shows up as a worse failure
 -- count with no indication of why.
 warnMissingStubs :: IO ()
-warnMissingStubs = do
-  mapM_ check stubIncludes
-  if BS.null preludeBytes
-    then putStrLn "prelude: none (set AIHC_CPP_BENCH_PRELUDE)"
-    else putStrLn ("prelude: " <> show (BS.length preludeBytes) <> " bytes prepended to every module")
+warnMissingStubs = mapM_ check stubIncludes
   where
     check dir = do
       present <- doesDirectoryExist dir
