@@ -25,12 +25,12 @@ where
 import Aihc.Cpp.Cursor (Cursor)
 import Control.DeepSeq (NFData)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Builder as BSB
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import Data.Set (Set)
 import qualified Data.Set as S
 import Data.Text (Text)
-import qualified Data.Text.Lazy.Builder as TB
 import GHC.Generics (Generic)
 
 -- $setup
@@ -45,12 +45,16 @@ data Config = Config
     -- | User-defined macros. These are expanded as object-like macros.
     -- Note that the values should include any necessary quoting. For
     -- example, to define a string macro, use @"\"value\""@.
-    configMacros :: !(Map Text Text)
+    --
+    -- Names and bodies are raw bytes: the preprocessor never decodes
+    -- them, so a @-D@ flag taken straight from @argv@ can be passed
+    -- through unchanged whatever its encoding.
+    configMacros :: !(Map ByteString ByteString)
   }
 
 data MacroDef
-  = ObjectMacro !Text
-  | FunctionMacro ![Text] !Text
+  = ObjectMacro !ByteString
+  | FunctionMacro ![ByteString] !ByteString
   deriving (Eq, Show)
 
 -- | Default configuration with sensible defaults.
@@ -106,6 +110,12 @@ data Diagnostic = Diagnostic
   { -- | The severity of the diagnostic.
     diagSeverity :: !Severity,
     -- | The diagnostic message text.
+    --
+    -- Unlike 'Result', a diagnostic is meant to be shown to a human, so
+    -- this is 'Text'. Message fragments taken from the source (an
+    -- @#error@ message, an include path) are decoded as UTF-8 with
+    -- invalid bytes replaced by U+FFFD; that substitution affects the
+    -- message only, never 'resultOutput'.
     diagMessage :: !Text,
     -- | The file where the diagnostic occurred.
     diagFile :: !FilePath,
@@ -116,8 +126,12 @@ data Diagnostic = Diagnostic
 
 -- | The result of preprocessing.
 data Result = Result
-  { -- | The preprocessed output text.
-    resultOutput :: !Text,
+  { -- | The preprocessed output.
+    --
+    -- Bytes the preprocessor did not itself generate are copied through
+    -- verbatim, so the output carries the input's encoding, whatever it
+    -- was. See 'Aihc.Cpp.preprocess' for the encoding contract.
+    resultOutput :: !ByteString,
     -- | Any diagnostics (warnings or errors) emitted during preprocessing.
     resultDiagnostics :: ![Diagnostic]
   }
@@ -134,8 +148,8 @@ data Step
     NeedInclude !IncludeRequest !(Maybe ByteString -> Step)
 
 data EngineState = EngineState
-  { stMacros :: !(Map Text MacroDef),
-    stOutput :: !TB.Builder,
+  { stMacros :: !(Map ByteString MacroDef),
+    stOutput :: !BSB.Builder,
     stOutputLineCount :: {-# UNPACK #-} !Int,
     stDiagnosticsRev :: ![Diagnostic],
     stPragmaOnceFiles :: !(Set FilePath),

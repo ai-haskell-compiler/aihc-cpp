@@ -8,19 +8,19 @@
 -- A lightweight cursor abstraction over a strict 'ByteString'. The cursor
 -- tracks a position into a shared buffer, enabling O(1) peeking and
 -- zero-copy slicing. All CPP-significant bytes are ASCII (0x00-0x7F),
--- so byte-level operations are safe; non-ASCII bytes (>= 0x80) can be
--- bulk-copied without decoding.
+-- so byte-level operations are safe; non-ASCII bytes (>= 0x80) are
+-- bulk-copied and never decoded, which is what makes the preprocessor
+-- agnostic to the source encoding.
 module Aihc.Cpp.Cursor
   ( Cursor (..),
     fromByteString,
-    fromText,
-    toText,
+    toBytes,
     null,
     peekByte,
     peekByte2,
     advance,
     advance2,
-    sliceText,
+    sliceBytes,
     sliceSince,
     skipWhile,
     skipToInteresting,
@@ -38,8 +38,6 @@ where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Text (Text)
-import qualified Data.Text.Encoding as TE
 import Data.Word (Word8)
 import Prelude hiding (null)
 
@@ -56,13 +54,9 @@ data Cursor = Cursor
 fromByteString :: ByteString -> Cursor
 fromByteString bs = Cursor bs 0
 
--- | Create a cursor from 'Text' by encoding to UTF-8.
-fromText :: Text -> Cursor
-fromText = fromByteString . TE.encodeUtf8
-
--- | Decode the remaining bytes from the cursor position as UTF-8 'Text'.
-toText :: Cursor -> Text
-toText (Cursor buf pos) = TE.decodeUtf8 (BS.drop pos buf)
+-- | The remaining bytes from the cursor position, as a zero-copy slice.
+toBytes :: Cursor -> ByteString
+toBytes (Cursor buf pos) = BS.drop pos buf
 
 -- | Is the cursor at the end of input?
 null :: Cursor -> Bool
@@ -107,17 +101,17 @@ advance2 :: Cursor -> Cursor
 advance2 (Cursor buf pos) = Cursor buf (pos + 2)
 {-# INLINE advance2 #-}
 
--- | Extract a zero-copy 'Text' slice from position @start@ to position
--- @end@ (exclusive) in the cursor's buffer.
-sliceText :: Int -> Int -> Cursor -> Text
-sliceText start end (Cursor buf _) =
-  TE.decodeUtf8 (BS.take (end - start) (BS.drop start buf))
-{-# INLINE sliceText #-}
+-- | Extract a zero-copy slice from position @start@ to position @end@
+-- (exclusive) in the cursor's buffer.
+sliceBytes :: Int -> Int -> Cursor -> ByteString
+sliceBytes start end (Cursor buf _) =
+  BS.take (end - start) (BS.drop start buf)
+{-# INLINE sliceBytes #-}
 
--- | Extract a zero-copy 'Text' slice from the given start position to
--- the cursor's current position.
-sliceSince :: Int -> Cursor -> Text
-sliceSince start cur = sliceText start (curPos cur) cur
+-- | Extract a zero-copy slice from the given start position to the
+-- cursor's current position.
+sliceSince :: Int -> Cursor -> ByteString
+sliceSince start cur = sliceBytes start (curPos cur) cur
 {-# INLINE sliceSince #-}
 
 -- | Advance the cursor while the predicate holds for the current byte.
