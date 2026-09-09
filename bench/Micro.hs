@@ -12,7 +12,7 @@
 -- comparison against GHC lives in @bench/compare-ghc.sh@ instead.
 module Main (main) where
 
-import Bench.Corpus (CorpusCase (..), corpusCases, generateCorpus)
+import Bench.Corpus (CorpusCase (..), corpusCases, defaultCorpusRoot, generateCorpus)
 import Bench.Run (LoadedCase (..), loadCase, runAihcPure)
 import Control.DeepSeq (force)
 import Control.Exception (evaluate)
@@ -31,7 +31,7 @@ import Test.Tasty.Bench (bench, bgroup, defaultMain, nf, nfIO)
 -- | Where the generated corpus lives. Overridable so CI can point it at a
 -- scratch directory, or a developer at a directory of real-world modules.
 corpusRoot :: IO FilePath
-corpusRoot = fromMaybe "bench/.corpus" <$> lookupEnv "AIHC_CPP_BENCH_CORPUS"
+corpusRoot = fromMaybe defaultCorpusRoot <$> lookupEnv "AIHC_CPP_BENCH_CORPUS"
 
 main :: IO ()
 main = do

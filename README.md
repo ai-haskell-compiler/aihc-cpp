@@ -76,8 +76,15 @@ the preprocessing itself is several times slower. The harness therefore:
 
 The corpus is generated, deterministic, and weighted towards the case that
 dominates real modules: thousands of lines the preprocessor merely copies, with
-a few directives at the top. Set `AIHC_CPP_BENCH_CORPUS` to point either layer
-at a directory of real-world modules instead.
+a few directives at the top. It is written under `dist-newstyle/`, away from the
+directories the formatter and linter walk — it is megabytes of generated Haskell,
+and hlint follows `#include` directives, so linting it costs orders of magnitude
+more memory than running the benchmarks does. Set `AIHC_CPP_BENCH_CORPUS` to
+point either layer at a directory of real-world modules instead.
+
+Both benchmark binaries are built with an RTS heap cap (`-M512m`), so an
+oversized corpus fails with a heap-overflow message rather than exhausting the
+machine.
 
 [cpphs]: https://hackage.haskell.org/package/cpphs
 

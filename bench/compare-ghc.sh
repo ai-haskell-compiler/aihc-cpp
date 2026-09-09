@@ -24,11 +24,14 @@
 #      number that describes preprocessing rather than the operating system.
 #
 # The corpus is also scaled up here (AIHC_CPP_BENCH_SCALE), so that the work
-# being measured is large enough to survive the subtraction.
+# being measured is large enough to survive the subtraction. It is written under
+# dist-newstyle rather than into the source tree: it is megabytes of generated
+# Haskell, and a linter walking it costs far more memory than anything the
+# benchmark itself does.
 #
 set -euo pipefail
 
-corpus="${AIHC_CPP_BENCH_CORPUS:-bench/.corpus-process}"
+corpus="${AIHC_CPP_BENCH_CORPUS:-dist-newstyle/bench-corpus-process}"
 runs="${AIHC_CPP_BENCH_RUNS:-20}"
 scale="${AIHC_CPP_BENCH_SCALE:-10}"
 

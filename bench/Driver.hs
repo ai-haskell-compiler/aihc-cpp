@@ -9,7 +9,7 @@
 module Main (main) where
 
 import Aihc.Cpp (Diagnostic (..), Result (..), Severity (..))
-import Bench.Corpus (CorpusCase (..), corpusCases, generateCorpus)
+import Bench.Corpus (CorpusCase (..), corpusCases, generateCorpus, maxScale)
 import Bench.Run (LoadedCase (..), loadCase, normalise, renderNormalised, runAihc)
 import qualified Data.ByteString as BS
 import Data.List (intercalate)
@@ -27,8 +27,10 @@ main = do
   case args of
     ["gen", root] -> generateCorpus 1 root
     ["gen", root, scale] -> case readMaybe scale of
-      Just n | n >= 1 -> generateCorpus n root
-      _ -> usage
+      Just n | n >= 1 && n <= maxScale -> generateCorpus n root
+      _ -> do
+        hPutStrLn stderr ("error: SCALE must be between 1 and " <> show maxScale)
+        usage
     -- Emits the corpus manifest as TSV so the shell harness does not have to
     -- keep its own copy of the case list, including which cases it is fair to
     -- compare against GHC's preprocessor.

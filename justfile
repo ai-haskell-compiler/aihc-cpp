@@ -23,7 +23,7 @@ fmt:
 check:
   nix develop --quiet --command cabal-gild --mode check --input aihc-cpp.cabal
   nix develop --quiet --command bash -c 'ormolu --mode check $(find src test app bench -name "*.hs" -not -path "*/Test/Fixtures/*" -not -path "*/.*")'
-  nix develop --quiet --command bash -c 'hlint -j $(find src test app bench -name "*.hs" -not -path "*/Test/Fixtures/*" -not -path "*/.*")'
+  nix develop --quiet --command bash -c 'hlint -j4 $(find src test app bench -name "*.hs" -not -path "*/Test/Fixtures/*" -not -path "*/.*")'
   cabal test -v0 all --ghc-options=-Werror --test-options='--hide-successes --quickcheck-tests 1000'
   nix develop --quiet --command bash -c 'shellcheck bench/*.sh'
   nix develop --quiet --command bash -c 'shfmt --diff --indent 2 --case-indent bench/*.sh'

@@ -54,7 +54,7 @@
         find src test app bench -name '*.hs' -not -path '*/Test/Fixtures/*' -not -path '*/.*' -print0 | xargs -0 -r ormolu --mode check
       '';
       haskell-lint = sourceCheck "aihc-cpp-haskell-lint" [pkgs.hlint pkgs.findutils] ''
-        find src test app bench -name '*.hs' -not -path '*/Test/Fixtures/*' -not -path '*/.*' -print0 | xargs -0 -r hlint
+        find src test app bench -name '*.hs' -not -path '*/Test/Fixtures/*' -not -path '*/.*' -print0 | xargs -0 -r hlint -j4
       '';
       shell-lint = sourceCheck "aihc-cpp-shell-lint" [pkgs.shellcheck pkgs.shfmt] ''
         shellcheck bench/*.sh

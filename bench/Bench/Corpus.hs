@@ -15,11 +15,34 @@ module Bench.Corpus
   ( CorpusCase (..),
     corpusCases,
     generateCorpus,
+    defaultCorpusRoot,
+    maxScale,
   )
 where
 
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath ((</>))
+
+-- | Where the generated corpus goes by default.
+--
+-- Deliberately outside @src@, @test@, @app@ and @bench@, the directories the
+-- formatter and linter walk. A generated corpus is megabytes of machine-written
+-- Haskell full of redundant brackets, and hlint follows @#include@ directives,
+-- so letting a linter reach it produces six-figure hint counts and exhausts
+-- memory. Putting it under @dist-newstyle@ makes that structurally impossible
+-- rather than depending on an exclusion pattern staying correct, and means
+-- @cabal clean@ disposes of it.
+defaultCorpusRoot :: FilePath
+defaultCorpusRoot = "dist-newstyle" </> "bench-corpus"
+
+-- | Largest accepted scale factor.
+--
+-- At the top of this range a case is a few tens of megabytes, which is already
+-- far more than is needed to swamp process startup. The cap is here so that a
+-- mistyped scale cannot fill the disk or push a benchmark past the heap limit
+-- the binaries are built with.
+maxScale :: Int
+maxScale = 50
 
 -- | One benchmark input: a top-level file plus any files it includes.
 data CorpusCase = CorpusCase
