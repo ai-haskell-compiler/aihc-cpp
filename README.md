@@ -31,11 +31,43 @@ just bench
 
 Measures raw throughput against the other two pure-Haskell C preprocessors on
 Hackage, [hpp] and [cpphs]. All three run in-process as libraries, on the same
-preloaded bytes, with output forced to normal form, so the only thing timed is
-preprocessing — no process startup, no reading the entry file, no lazy IO left
-unevaluated.
+preloaded bytes, with output forced, so the only thing timed is preprocessing —
+no process startup, no reading the entry file, no lazy IO left unevaluated.
 
-Indicative figures on an M-series Mac, GHC 9.12.4:
+### Real-world corpus
+
+Point the benchmark at a directory of Haskell source and it will sample the
+CPP-using modules under it:
+
+```bash
+AIHC_CPP_BENCH_CORPUS=/path/to/checkout just bench
+```
+
+Over 178 modules (2.2 MB) sampled from 211 Hackage packages, on an M-series Mac
+with GHC 9.12.4:
+
+| | time | modules preprocessed | output |
+| --- | --- | --- | --- |
+| aihc-cpp | 87.8 ms | 178 / 178 | 2104 KiB |
+| cpphs | 136 ms | 175 / 178 | 2107 KiB |
+| hpp | 664 ms | 151 / 178 | 1149 KiB |
+
+Read the failure column alongside the times: real modules reference headers that
+are absent and macros that are never defined, the three tools disagree about
+which of those is fatal, and a tool that gives up early does less work. hpp is
+slowest despite producing a little over half the output.
+
+The sample is bounded by `AIHC_CPP_BENCH_MAX_BYTES` (2 MB by default), because
+the corpus is held in memory three times over and a Haskell `String` costs
+upwards of sixteen bytes per character. Modules are taken at an even stride
+through the sorted file list, so the sample spans the tree rather than stopping
+inside whichever package sorts first, and the same modules are chosen every run.
+
+### Generated corpus
+
+With no `AIHC_CPP_BENCH_CORPUS` set, the benchmark generates a deterministic
+corpus of its own under `dist-newstyle/`. It is cheap and stable, which makes it
+useful for spotting regressions, but it is artificial:
 
 | case | aihc-cpp | hpp | cpphs |
 | --- | --- | --- | --- |
@@ -45,31 +77,41 @@ Indicative figures on an M-series Mac, GHC 9.12.4:
 | literals | 6.26 ms | 69.4 ms | 4.19 ms |
 | includes | 14.2 ms | 164 ms | 13.3 ms |
 
-The corpus is generated, deterministic, and weighted towards the case that
-dominates real modules: thousands of lines the preprocessor merely copies, with
-a few directives at the top. Set `AIHC_CPP_BENCH_CORPUS` to point it at a
-directory of real-world modules instead.
+Measured over 1,631 CPP-using modules from 211 Hackage packages, real code has a
+median size of 6.2 KB with 3.5% directive lines; conditionals dominate the
+directive mix (`#if` and `#endif` together outnumber `#define` more than ten to
+one); `__GLASGOW_HASKELL__`, `MIN_VERSION_base` and `mingw32_HOST_OS` account
+for most macro references, nearly all inside `#if` conditions rather than
+expanded into the output; and a module that includes anything usually includes
+one or two headers.
 
-The benchmark does not check that the three agree, and is not meant to.
+So `passthrough` and `conditionals` resemble real code, while `macros` (a
+function-like macro expanded on every line) and `includes` (24 included files)
+are far heavier than anything real. They isolate a cost usefully and mislead if
+read as a workload. Use the real-world corpus for throughput claims.
+
+### What is not measured
+
+The benchmark does not check that the three tools agree, and is not meant to.
 Preprocessing Haskell is under-specified — the implementations differ on comment
 handling, on rescanning, on what survives inside a literal — so demanding
 equivalence would mean either dropping the interesting inputs or holding
 aihc-cpp to another implementation's accidents. Behaviour is pinned down by the
 test suite, which compares against cpphs as an oracle; this measures speed. The
-output sizes printed before the timings are a sanity check that the three are
+output sizes reported before the timings are a sanity check that the tools are
 doing comparable amounts of work, not a contract.
 
-There is deliberately no comparison against the C preprocessor GHC invokes.
-Running it means forking a process, and that dominates: on a 100KB input the
-fork and startup cost several times more than the preprocessing, so the
-measurement mostly reports how expensive it is to start a compiler driver.
+There is also no comparison against the C preprocessor GHC invokes. Running it
+means forking a process, and on inputs this size the fork and startup cost
+several times more than the preprocessing, so the measurement would mostly
+report how expensive it is to start a compiler driver.
 
-The corpus is written under `dist-newstyle/`, away from the directories the
-formatter and linter walk — it is megabytes of generated Haskell, and hlint
-follows `#include` directives, so linting it costs orders of magnitude more
-memory than running the benchmarks does. The benchmark binary carries an RTS
-heap cap (`-M512m`) so a corpus pointed somewhere unexpected fails with a
-heap-overflow message rather than exhausting the machine.
+The generated corpus is written under `dist-newstyle/`, away from the
+directories the formatter and linter walk — it is megabytes of generated
+Haskell, and hlint follows `#include` directives, so linting it costs orders of
+magnitude more memory than running the benchmarks does. The binary carries an
+RTS heap cap (`-M512m`) so an oversized corpus fails with a heap-overflow
+message rather than exhausting the machine.
 
 [hpp]: https://hackage.haskell.org/package/hpp
 [cpphs]: https://hackage.haskell.org/package/cpphs

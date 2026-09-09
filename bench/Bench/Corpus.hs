@@ -9,6 +9,22 @@
 -- The cases are chosen to isolate the different costs a preprocessor pays, so
 -- that a regression can be attributed to one of them rather than showing up as
 -- a single number that moved.
+--
+-- This corpus is artificial, and it is worth being explicit about where it
+-- departs from reality. Measured over 1,631 CPP-using modules from 211 Hackage
+-- packages: the median module is 6.2KB with 3.5% directive lines; conditionals
+-- dominate the directive mix (@#if@ and @#endif@ together outnumber @#define@
+-- by more than ten to one); @__GLASGOW_HASKELL__@, @MIN_VERSION_base@ and
+-- @mingw32_HOST_OS@ account for most macro references, nearly all of them
+-- inside @#if@ conditions rather than expanded into the output; and a module
+-- that includes anything usually includes one or two headers.
+--
+-- So 'passthroughCase' and 'conditionalsCase' are close to real code, while
+-- 'macrosCase' (a function-like macro expanded on every line) and
+-- 'includesCase' (24 included files) are far heavier than anything real.
+-- They are useful for isolating a cost, and misleading if read as a workload.
+-- Point the benchmark at real source instead — see the AIHC_CPP_BENCH_CORPUS
+-- setting in @bench\/Micro.hs@ — before drawing conclusions about throughput.
 module Bench.Corpus
   ( CorpusCase (..),
     corpusCases,
