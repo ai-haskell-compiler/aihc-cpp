@@ -20,7 +20,7 @@ main = do
         "cpp-oracle"
         ( checks
             <> [linePragmaTest, dateTimeTest, functionMacroArgumentTest, functionMacroUnclosedCallTest, definedConditionSpacingTest, stringContinuationTests, tokenPastingTests, ccallLineCommentTest]
-            <> [pragmaOnceTest]
+            <> [pragmaOnceTest, pragmaInsideBlockCommentTests]
             <> [QC.testProperty "dummy quickcheck property" prop_dummy]
         )
     )
@@ -224,6 +224,52 @@ pragmaOnceTest =
               then pure ()
               else assertFailure ("expected guarded include once, got: " <> show output)
       Done _ -> assertFailure "expected include continuation step"
+
+pragmaInsideBlockCommentTests :: TestTree
+pragmaInsideBlockCommentTests =
+  testGroup
+    "pragma inside a Haskell block comment"
+    [ testCase "#-} does not close the enclosing comment" $
+        case preprocess defaultConfig (TE.encodeUtf8 pragmaInBlockCommentInput) of
+          Done result -> do
+            resultDiagnostics result @?= []
+            resultOutput result
+              @?= "#line 1 \"<input>\"\n{-\n#if 0\n{-# INLINABLE foo #-}\n#endif\n-}\nlive\n"
+          _ -> assertFailure "expected Done",
+      testCase "commented-out #if 0 does not delete live code" $
+        case preprocess defaultConfig (TE.encodeUtf8 pragmaInBlockCommentElseInput) of
+          Done result -> do
+            resultDiagnostics result @?= []
+            if "kept" `T.isInfixOf` resultOutput result
+              then pure ()
+              else assertFailure ("expected commented-out branch to stay intact, got: " <> show (resultOutput result))
+          _ -> assertFailure "expected Done"
+    ]
+
+pragmaInBlockCommentInput :: T.Text
+pragmaInBlockCommentInput =
+  T.unlines
+    [ "{-",
+      "#if 0",
+      "{-# INLINABLE foo #-}",
+      "#endif",
+      "-}",
+      "live"
+    ]
+
+pragmaInBlockCommentElseInput :: T.Text
+pragmaInBlockCommentElseInput =
+  T.unlines
+    [ "{-",
+      "{-# INLINABLE foo #-}",
+      "#if 0",
+      "kept",
+      "#else",
+      "also kept",
+      "#endif",
+      "-}",
+      "live"
+    ]
 
 ccallLineCommentInput :: T.Text
 ccallLineCommentInput =
