@@ -44,11 +44,11 @@ import Aihc.Cpp.Cursor
     peekByteAt,
     skipNewline,
     skipWhile,
-    sliceText,
-    toText,
+    sliceBytes,
+    toBytes,
   )
 import Aihc.Cpp.Evaluator (evalCondition)
-import Aihc.Cpp.Parser (Directive (..), parseDirective)
+import Aihc.Cpp.Parser (Directive (..), isSpaceChar, parseDirective)
 import Aihc.Cpp.Scanner (expandLineBySpanMultiline, lineScanFinalCDepth, lineScanFinalHsDepth, lineScanSpans, scanLine, scanLineDepthOnly)
 import Aihc.Cpp.Types
   ( CondFrame (..),
@@ -71,23 +71,21 @@ import Aihc.Cpp.Types
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BSB
+import qualified Data.ByteString.Char8 as C
 import qualified Data.ByteString.Lazy as BSL
-import Data.Char (isSpace)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as S
 import Data.Text (Text)
-import qualified Data.Text as T
-import qualified Data.Text.Lazy as TL
-import qualified Data.Text.Lazy.Builder as TB
+import qualified Data.Text.Encoding as TE
+import qualified Data.Text.Encoding.Error as TEE
 import System.FilePath (takeDirectory, (</>))
 
 -- $setup
 -- >>> :set -XOverloadedStrings
 -- >>> import qualified Data.Map.Strict as M
--- >>> import qualified Data.Text as T
--- >>> import qualified Data.Text.IO as T
+-- >>> import qualified Data.ByteString.Char8 as C
 
 -- | Preprocess C preprocessor directives in the input.
 --
@@ -105,7 +103,7 @@ import System.FilePath (takeDirectory, (</>))
 -- Object-like macros are expanded in the output:
 --
 -- >>> let Done r = preprocess defaultConfig "#define FOO 42\nThe answer is FOO"
--- >>> T.putStr (resultOutput r)
+-- >>> C.putStr (resultOutput r)
 -- #line 1 "<input>"
 -- <BLANKLINE>
 -- The answer is 42
@@ -113,7 +111,7 @@ import System.FilePath (takeDirectory, (</>))
 -- Function-like macros are also supported:
 --
 -- >>> let Done r = preprocess defaultConfig "#define MAX(a,b) ((a) > (b) ? (a) : (b))\nMAX(3, 5)"
--- >>> T.putStr (resultOutput r)
+-- >>> C.putStr (resultOutput r)
 -- #line 1 "<input>"
 -- <BLANKLINE>
 -- ((3) > (5) ? (3) : (5))
@@ -125,7 +123,7 @@ import System.FilePath (takeDirectory, (</>))
 -- >>> :{
 -- let Done r = preprocess defaultConfig
 --       "#define DEBUG 1\n#if DEBUG\ndebug mode\n#else\nrelease mode\n#endif"
--- in T.putStr (resultOutput r)
+-- in C.putStr (resultOutput r)
 -- :}
 -- #line 1 "<input>"
 -- <BLANKLINE>
@@ -144,7 +142,7 @@ import System.FilePath (takeDirectory, (</>))
 -- >>> :{
 -- let NeedInclude req k = preprocess defaultConfig "#include \"header.h\"\nmain code"
 --     Done r = k (Just "-- header content")
--- in T.putStr (resultOutput r)
+-- in C.putStr (resultOutput r)
 -- :}
 -- #line 1 "<input>"
 -- #line 1 "./header.h"
@@ -158,7 +156,7 @@ import System.FilePath (takeDirectory, (</>))
 -- let NeedInclude _ k = preprocess defaultConfig "#include \"missing.h\""
 --     Done r = k Nothing
 -- in do
---   T.putStr (resultOutput r)
+--   C.putStr (resultOutput r)
 --   mapM_ print (resultDiagnostics r)
 -- :}
 -- #line 1 "<input>"
@@ -171,7 +169,7 @@ import System.FilePath (takeDirectory, (</>))
 -- >>> :{
 -- let Done r = preprocess defaultConfig "#warning This is a warning"
 -- in do
---   T.putStr (resultOutput r)
+--   C.putStr (resultOutput r)
 --   mapM_ print (resultDiagnostics r)
 -- :}
 -- #line 1 "<input>"
@@ -183,12 +181,38 @@ import System.FilePath (takeDirectory, (</>))
 -- >>> :{
 -- let Done r = preprocess defaultConfig "#error Build failed\nthis line is not processed"
 -- in do
---   T.putStr (resultOutput r)
+--   C.putStr (resultOutput r)
 --   mapM_ print (resultDiagnostics r)
 -- :}
 -- #line 1 "<input>"
 -- <BLANKLINE>
 -- Diagnostic {diagSeverity = Error, diagMessage = "Build failed", diagFile = "<input>", diagLine = 1}
+--
+-- === Source encoding
+--
+-- The preprocessor is agnostic to the source encoding. Every character
+-- that is significant to CPP is ASCII, so the input is never decoded:
+-- bytes the preprocessor did not itself generate are copied from
+-- 'ByteString' input to 'ByteString' output verbatim. A Latin-1 module, a
+-- UTF-8 one, or a file with no consistent encoding at all all pass
+-- through unchanged, and no input can make 'preprocess' fail to decode
+-- something or raise an exception.
+--
+-- Byte 169 (0xA9, a Latin-1 copyright sign) is neither decoded nor
+-- rewritten; it is shown escaped here only because that keeps this
+-- example's output pure ASCII:
+--
+-- >>> let Done r = preprocess defaultConfig "-- \169 2026\nx = 1\n"
+-- >>> resultOutput r
+-- "#line 1 \"<input>\"\n-- \169 2026\nx = 1\n"
+--
+-- This is deliberately looser than GHC, which decodes source as UTF-8 --
+-- but only where it must lex a token. GHC accepts an undecodable byte
+-- inside a comment (real Hackage packages ship such modules) and rejects
+-- one inside a string literal. Rejecting the file here would fail
+-- modules that genuinely compile, so encoding is left to the caller: the
+-- output bytes are exactly what a compiler front-end should lex, and its
+-- lexer decides what is valid.
 preprocess :: Config -> ByteString -> Step
 preprocess cfg input =
   let cursor = fromByteString input
@@ -201,9 +225,9 @@ preprocess cfg input =
             }
 
     finish st =
-      let out = TL.toStrict (TB.toLazyText (stOutput st))
+      let out = BSL.toStrict (BSB.toLazyByteString (stOutput st))
           outWithTrailingNewline =
-            if T.null out
+            if BS.null out
               then out
               else out <> "\n"
        in Done
@@ -234,7 +258,7 @@ nextLine cur =
         then -- Backslash continuation: join lines, stripping '\' and '\n'
           joinContinuationLines cur lineStart lineEnd rest
         else
-          let lineText = sliceText lineStart lineEnd cur
+          let lineText = sliceBytes lineStart lineEnd cur
            in if hasGccStringContinuation emptyQuoteState lineText
                 then joinStringContinuationLines cur lineStart lineEnd rest
                 else (lineSlice lineEnd cur, 1, rest)
@@ -302,14 +326,14 @@ emptyQuoteState = QuoteState False False False
 -- final backslash is the CPP continuation marker.  GHC's default CPP-like
 -- handling also accepts the single-backslash spelling, so only the double
 -- spelling is spliced here.
-hasGccStringContinuation :: QuoteState -> Text -> Bool
+hasGccStringContinuation :: QuoteState -> ByteString -> Bool
 hasGccStringContinuation st lineText =
-  qsInString (scanQuoteState st lineText) && "\\\\" `T.isSuffixOf` lineText
+  qsInString (scanQuoteState st lineText) && "\\\\" `C.isSuffixOf` lineText
 
 joinStringContinuationLines :: Cursor -> Int -> Int -> Cursor -> (Cursor, Int, Cursor)
 joinStringContinuationLines origCur lineStart firstLineEnd firstRest =
   let buf = curBuf origCur
-      firstSegment = sliceText lineStart (firstLineEnd - 1) origCur
+      firstSegment = sliceBytes lineStart (firstLineEnd - 1) origCur
       firstBytes = BSB.byteString (sliceBS lineStart (firstLineEnd - 1) buf)
    in go firstBytes 1 firstRest (scanQuoteState emptyQuoteState firstSegment)
   where
@@ -322,26 +346,26 @@ joinStringContinuationLines origCur lineStart firstLineEnd firstRest =
               segStart = curPos rest
               segEnd = curPos eol
               rest' = fromMaybe eol (skipNewline eol)
-              segmentText = sliceText segStart segEnd origCur
+              segmentText = sliceBytes segStart segEnd origCur
            in if hasGccStringContinuation quoteState segmentText
                 then
                   let segmentBytes = BSB.byteString (sliceBS segStart (segEnd - 1) (curBuf origCur))
-                      scannedText = sliceText segStart (segEnd - 1) origCur
+                      scannedText = sliceBytes segStart (segEnd - 1) origCur
                    in go (acc <> segmentBytes) (spanCount + 1) rest' (scanQuoteState quoteState scannedText)
                 else
                   let segmentBytes = BSB.byteString (sliceBS segStart segEnd (curBuf origCur))
                       joined = BSL.toStrict (BSB.toLazyByteString (acc <> segmentBytes))
                    in (fromByteString joined, spanCount + 1, rest')
 
-scanQuoteState :: QuoteState -> Text -> QuoteState
+scanQuoteState :: QuoteState -> ByteString -> QuoteState
 scanQuoteState = go
   where
     go st txt =
-      case T.uncons txt of
+      case C.uncons txt of
         Nothing -> st
         Just (c, rest)
           | qsInString st ->
-              if qsEscaped st && isSpace c
+              if qsEscaped st && isSpaceChar c
                 then go st {qsEscaped = False} (dropStringGapClose rest)
                 else
                   go
@@ -362,8 +386,8 @@ scanQuoteState = go
           | otherwise -> go st {qsEscaped = False} rest
 
     dropStringGapClose txt =
-      let afterSpace = T.dropWhile isSpace txt
-       in case T.uncons afterSpace of
+      let afterSpace = C.dropWhile isSpaceChar txt
+       in case C.uncons afterSpace of
             Just ('\\', rest) -> rest
             _ -> afterSpace
 
@@ -384,7 +408,7 @@ processFile filePath cursor trailingNl stack !lineNo st k =
       hasTrailingNl = trailingNl && not (atEnd restCursor) || (trailingNl && atEnd restCursor)
       -- Actually: trailingNl flag is set at processFile entry for includes.
       -- We just propagate it. The check at atEnd above handles the final empty line.
-      lineText = toText lineCur
+      lineText = toBytes lineCur
       startsInBlockComment = stHsBlockCommentDepth st > 0 || stCBlockCommentDepth st > 0
       parsedDirective =
         if startsInBlockComment
@@ -547,20 +571,20 @@ handleDirective ctx st directive =
         _ : rest ->
           continueBlankWithStack ctx rest st
     DirWarning msg ->
-      addDiagnosticWhenActive ctx Warning msg st
+      addDiagnosticWhenActive ctx Warning (messageText msg) st
     DirError msg ->
       if currentActive (lcStack ctx)
         then
           lcDone
             ctx
-            (emitDirectiveBlank ctx (addDiag Error msg (lcFilePath ctx) (lcLineNo ctx) st))
+            (emitDirectiveBlank ctx (addDiag Error (messageText msg) (lcFilePath ctx) (lcLineNo ctx) st))
         else continueBlank ctx st
     DirLine n mPath ->
       handleLineDirective ctx st n mPath
     DirPragmaOnce ->
       handlePragmaOnceDirective ctx st
     DirUnsupported name ->
-      addDiagnosticWhenActive ctx Warning ("unsupported directive: " <> name) st
+      addDiagnosticWhenActive ctx Warning ("unsupported directive: " <> messageText name) st
 
 emitDirectiveBlank :: LineContext -> EngineState -> EngineState
 emitDirectiveBlank ctx = emitBlankLines (lcLineSpan ctx)
@@ -571,7 +595,7 @@ continueBlank ctx st = lcContinue ctx (emitDirectiveBlank ctx st)
 continueBlankWithStack :: LineContext -> [CondFrame] -> EngineState -> Step
 continueBlankWithStack ctx stack st = lcContinueWith ctx stack (emitDirectiveBlank ctx st)
 
-mutateMacrosWhenActive :: LineContext -> EngineState -> (Map Text MacroDef -> Map Text MacroDef) -> Step
+mutateMacrosWhenActive :: LineContext -> EngineState -> (Map ByteString MacroDef -> Map ByteString MacroDef) -> Step
 mutateMacrosWhenActive ctx st mutate =
   if currentActive (lcStack ctx)
     then continueBlank ctx (st {stMacros = mutate (stMacros st)})
@@ -594,7 +618,7 @@ pushConditionalFrame ctx st cond =
   let frame = mkFrame (currentActive (lcStack ctx)) cond
    in continueBlankWithStack ctx (frame : lcStack ctx) st
 
-handleElifDirective :: LineContext -> EngineState -> Text -> Step
+handleElifDirective :: LineContext -> EngineState -> ByteString -> Step
 handleElifDirective ctx st expr =
   case lcStack ctx of
     [] ->
@@ -637,13 +661,13 @@ handleElseDirective ctx st =
                   }
            in continueBlankWithStack ctx (f' : rest) st
 
-handleIncludeDirective :: LineContext -> EngineState -> IncludeKind -> Text -> Step
+handleIncludeDirective :: LineContext -> EngineState -> IncludeKind -> ByteString -> Step
 handleIncludeDirective ctx st kind includeTarget
   | not (currentActive (lcStack ctx)) = continueBlank ctx st
   | S.member includeFilePath (stPragmaOnceFiles st) = continueBlank ctx st
   | otherwise = NeedInclude includeReq nextStep
   where
-    includePathText = T.unpack includeTarget
+    includePathText = C.unpack includeTarget
     includeFilePath =
       case kind of
         IncludeLocal -> takeDirectory (lcFilePath ctx) </> includePathText
@@ -659,7 +683,7 @@ handleIncludeDirective ctx st kind includeTarget
     nextStep Nothing =
       lcContinue
         ctx
-        (addDiag Error ("missing include: " <> includeTarget) (lcFilePath ctx) (lcLineNo ctx) st)
+        (addDiag Error ("missing include: " <> messageText includeTarget) (lcFilePath ctx) (lcLineNo ctx) st)
     nextStep (Just includeBytes) =
       let includeCursor = fromByteString includeBytes
           -- Include files treat trailing newlines as producing an extra
@@ -702,11 +726,11 @@ handleLineDirective ctx st lineNumber maybePath
             (stWithLinePragma {stCurrentLine = lineNumber})
             (lcDone ctx)
 
-emitLine :: Text -> EngineState -> EngineState
+emitLine :: ByteString -> EngineState -> EngineState
 emitLine line st =
-  let sep = if stOutputLineCount st > 0 then TB.singleton '\n' else mempty
+  let sep = if stOutputLineCount st > 0 then BSB.char8 '\n' else mempty
    in st
-        { stOutput = stOutput st <> sep <> TB.fromText line,
+        { stOutput = stOutput st <> sep <> BSB.byteString line,
           stOutputLineCount = stOutputLineCount st + 1
         }
 
@@ -714,11 +738,20 @@ emitBlankLines :: Int -> EngineState -> EngineState
 emitBlankLines n st
   | n <= 0 = st
   | otherwise =
-      let newlines = mconcat (replicate n (TB.singleton '\n'))
+      let newlines = mconcat (replicate n (BSB.char8 '\n'))
        in st
             { stOutput = stOutput st <> newlines,
               stOutputLineCount = stOutputLineCount st + n
             }
+
+-- | Turn a fragment of source into human-readable message text.
+--
+-- This is the only place the preprocessor decodes anything. It is a
+-- display concern: 'Diagnostic' is meant to be shown to a person, so
+-- invalid UTF-8 becomes U+FFFD here rather than propagating bytes into
+-- the message. 'resultOutput' is never decoded and never substituted.
+messageText :: ByteString -> Text
+messageText = TE.decodeUtf8With TEE.lenientDecode
 
 addDiag :: Severity -> Text -> FilePath -> Int -> EngineState -> EngineState
 addDiag sev msg filePath lineNo st =
@@ -733,5 +766,5 @@ addDiag sev msg filePath lineNo st =
           : stDiagnosticsRev st
     }
 
-linePragma :: Int -> FilePath -> Text
-linePragma n path = "#line " <> T.pack (show n) <> " \"" <> T.pack path <> "\""
+linePragma :: Int -> FilePath -> ByteString
+linePragma n path = "#line " <> C.pack (show n) <> " \"" <> C.pack path <> "\""

@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Aihc.Cpp.Evaluator
@@ -22,52 +23,53 @@ module Aihc.Cpp.Evaluator
   )
 where
 
-import Aihc.Cpp.Parser (isIdentChar, isIdentStart, isOpChar)
+import Aihc.Cpp.Parser (isIdentChar, isIdentStart, isOpChar, isSpaceChar)
 import Aihc.Cpp.Types (EngineState (..), MacroDef (..))
-import Data.Char (isDigit, isSpace)
+import Data.Bits ((.&.))
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Builder as BSB
+import qualified Data.ByteString.Char8 as C
+import qualified Data.ByteString.Lazy as BSL
+import Data.Char (isDigit)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import Data.Set (Set)
 import qualified Data.Set as S
-import Data.Text (Text)
-import qualified Data.Text as T
-import qualified Data.Text.Lazy as TL
-import qualified Data.Text.Lazy.Builder as TB
-import qualified Data.Text.Read as TR
 
 -- | Expand macros in a single piece of text using the blue-paint algorithm.
 -- A single pass with a suppression set replaces the previous iterate-up-to-32
 -- fixpoint approach.
-expandMacros :: EngineState -> Text -> Text
+expandMacros :: EngineState -> ByteString -> ByteString
 expandMacros st txt =
-  builderToText (expandBlue st S.empty False False False (TB.fromText txt))
+  builderToBytes (expandBlue st S.empty False False False (BSB.byteString txt))
 
 -- | Expand macros with multi-line support. When a function-like macro call
 -- spans multiple lines, continuation lines are consumed from @moreLines@.
 -- Returns the expanded text and the number of extra lines consumed.
-expandMacrosMultiline :: EngineState -> Text -> [Text] -> (Text, Int)
+expandMacrosMultiline :: EngineState -> ByteString -> [ByteString] -> (ByteString, Int)
 expandMacrosMultiline st txt moreLines =
   let extraNeeded = countExtraLinesConsumed st txt moreLines
    in if extraNeeded == 0
         then (expandMacros st txt, 0)
         else
           let combinedLines = txt : take extraNeeded moreLines
-              combined = T.intercalate "\n" combinedLines
+              combined = C.intercalate "\n" combinedLines
               expanded = expandMacros st combined
            in (expanded, extraNeeded)
 
 -- | Count how many extra lines a function macro call consumes.
 -- Scans the first line for an identifier that matches a function macro,
 -- then checks if parseCallArgs needs to span into continuation lines.
-countExtraLinesConsumed :: EngineState -> Text -> [Text] -> Int
+countExtraLinesConsumed :: EngineState -> ByteString -> [ByteString] -> Int
 countExtraLinesConsumed st txt moreLines = scanForFunctionMacro False False False txt
   where
     macros = stMacros st
 
-    scanForFunctionMacro :: Bool -> Bool -> Bool -> Text -> Int
-    scanForFunctionMacro _ _ _ t | T.null t = 0
+    scanForFunctionMacro :: Bool -> Bool -> Bool -> ByteString -> Int
+    scanForFunctionMacro _ _ _ t | C.null t = 0
     scanForFunctionMacro inString inChar escaped t =
-      case T.uncons t of
+      case C.uncons t of
         Nothing -> 0
         Just (c, rest)
           | inString ->
@@ -84,7 +86,7 @@ countExtraLinesConsumed st txt moreLines = scanForFunctionMacro False False Fals
           | c == '"' -> scanForFunctionMacro True False False rest
           | c == '\'' -> scanForFunctionMacro False True False rest
           | isIdentStart c ->
-              let (ident, rest') = T.span isIdentChar t
+              let (ident, rest') = C.span isIdentChar t
                in case M.lookup ident macros of
                     Just (FunctionMacro _ _) ->
                       case tryMultilineCallArgs rest' of
@@ -95,12 +97,12 @@ countExtraLinesConsumed st txt moreLines = scanForFunctionMacro False False Fals
 
     -- Try to parse function call args, potentially spanning multiple lines.
     -- Returns Just n if the call spans n extra lines, Nothing if no call.
-    tryMultilineCallArgs :: Text -> Maybe Int
-    tryMultilineCallArgs rest = seekOpenParen (T.dropWhile isSpace rest) 0
+    tryMultilineCallArgs :: ByteString -> Maybe Int
+    tryMultilineCallArgs rest = seekOpenParen (C.dropWhile isSpaceChar rest) 0
 
-    seekOpenParen :: Text -> Int -> Maybe Int
+    seekOpenParen :: ByteString -> Int -> Maybe Int
     seekOpenParen remaining extraLines =
-      case T.uncons remaining of
+      case C.uncons remaining of
         Just ('(', afterOpen) ->
           findClosingParen 0 afterOpen extraLines
         Just _ ->
@@ -109,20 +111,20 @@ countExtraLinesConsumed st txt moreLines = scanForFunctionMacro False False Fals
           case drop extraLines moreLines of
             [] -> Nothing
             (nextLine : _) ->
-              seekOpenParen (T.dropWhile isSpace nextLine) (extraLines + 1)
+              seekOpenParen (C.dropWhile isSpaceChar nextLine) (extraLines + 1)
 
-    findClosingParen :: Int -> Text -> Int -> Maybe Int
+    findClosingParen :: Int -> ByteString -> Int -> Maybe Int
     findClosingParen = goClosing False False False
       where
-        goClosing :: Bool -> Bool -> Bool -> Int -> Text -> Int -> Maybe Int
+        goClosing :: Bool -> Bool -> Bool -> Int -> ByteString -> Int -> Maybe Int
         goClosing inString inChar escaped depth remaining extraLines =
-          case T.uncons remaining of
+          case C.uncons remaining of
             Nothing ->
               -- Need more lines
               case drop extraLines moreLines of
                 [] -> Nothing -- No more lines, unclosed call
                 (nextLine : _) ->
-                  goClosing inString inChar escaped depth (T.cons '\n' nextLine) (extraLines + 1)
+                  goClosing inString inChar escaped depth (C.cons '\n' nextLine) (extraLines + 1)
             Just (ch, rest)
               | inString ->
                   let escaped' = ch == '\\' && not escaped
@@ -144,244 +146,272 @@ countExtraLinesConsumed st txt moreLines = scanForFunctionMacro False False Fals
 
 -- | Blue-paint macro expansion engine. Uses a suppression set (@painted@)
 -- to prevent infinite recursion instead of iterating to a fixpoint.
--- Output is accumulated via a lazy 'TB.Builder' for amortized O(n).
-expandBlue :: EngineState -> Set Text -> Bool -> Bool -> Bool -> TB.Builder -> TB.Builder
+-- Output is accumulated via a lazy 'BSB.Builder' for amortized O(n).
+expandBlue :: EngineState -> Set ByteString -> Bool -> Bool -> Bool -> BSB.Builder -> BSB.Builder
 expandBlue st painted inString inChar escaped input =
-  let txt = builderToText input
+  let txt = builderToBytes input
    in goText st painted inString inChar escaped txt mempty
 
 -- | Walk the input text, expanding macros with blue-paint suppression.
-goText :: EngineState -> Set Text -> Bool -> Bool -> Bool -> Text -> TB.Builder -> TB.Builder
-goText _ _ _ _ _ txt acc | T.null txt = acc
+goText :: EngineState -> Set ByteString -> Bool -> Bool -> Bool -> ByteString -> BSB.Builder -> BSB.Builder
+goText _ _ _ _ _ txt acc | C.null txt = acc
 goText st painted inString inChar escaped txt acc =
-  case T.uncons txt of
+  case C.uncons txt of
     Nothing -> acc
     Just (c, rest)
       | inString ->
           let escaped' = c == '\\' && not escaped
               inString' = not (c == '"' && not escaped)
-           in goText st painted inString' False escaped' rest (acc <> TB.singleton c)
+           in goText st painted inString' False escaped' rest (acc <> BSB.char8 c)
       | inChar ->
           let escaped' = c == '\\' && not escaped
               inChar' = not (c == '\'' && not escaped)
-           in goText st painted False inChar' escaped' rest (acc <> TB.singleton c)
+           in goText st painted False inChar' escaped' rest (acc <> BSB.char8 c)
       | startsHsBlockComment txt ->
           let (commentText, remaining) = consumeHsBlockComment txt
-           in goText st painted False False False remaining (acc <> TB.fromText commentText)
+           in goText st painted False False False remaining (acc <> BSB.byteString commentText)
       | c == '"' ->
-          goText st painted True False False rest (acc <> TB.singleton c)
+          goText st painted True False False rest (acc <> BSB.char8 c)
       | c == '\'' ->
-          goText st painted False True False rest (acc <> TB.singleton c)
+          goText st painted False True False rest (acc <> BSB.char8 c)
       | isIdentStart c ->
           expandIdentBlue st painted txt acc
       | c == '-',
-        Just ('-', _) <- T.uncons rest ->
+        Just ('-', _) <- C.uncons rest ->
           -- Haskell line comment: copy remainder verbatim without macro expansion
-          acc <> TB.fromText txt
+          acc <> BSB.byteString txt
       | otherwise ->
-          goText st painted False False False rest (acc <> TB.singleton c)
+          goText st painted False False False rest (acc <> BSB.char8 c)
 
 -- | Handle an identifier during blue-paint expansion.
-expandIdentBlue :: EngineState -> Set Text -> Text -> TB.Builder -> TB.Builder
+expandIdentBlue :: EngineState -> Set ByteString -> ByteString -> BSB.Builder -> BSB.Builder
 expandIdentBlue st painted txt acc =
-  let (ident, rest) = T.span isIdentChar txt
+  let (ident, rest) = C.span isIdentChar txt
    in if S.member ident painted
         then -- Blue-painted: copy verbatim, don't expand
-          goText st painted False False False rest (acc <> TB.fromText ident)
+          goText st painted False False False rest (acc <> BSB.byteString ident)
         else case ident of
           "__LINE__" ->
-            goText st painted False False False rest (acc <> TB.fromString (show (stCurrentLine st)))
+            goText st painted False False False rest (acc <> BSB.string8 (show (stCurrentLine st)))
           "__FILE__" ->
-            goText st painted False False False rest (acc <> TB.fromString (show (stCurrentFile st)))
+            goText st painted False False False rest (acc <> BSB.string8 (show (stCurrentFile st)))
           _ ->
             case M.lookup ident (stMacros st) of
               Just (ObjectMacro replacement) ->
                 let painted' = S.insert ident painted
                     replacement' = normalizeObjectReplacement replacement
-                    expanded = builderToText (goText st painted' False False False replacement' mempty)
-                 in goText st painted False False False rest (acc <> TB.fromText expanded)
+                    expanded = builderToBytes (goText st painted' False False False replacement' mempty)
+                 in goText st painted False False False rest (acc <> BSB.byteString expanded)
               Just (FunctionMacro params body) ->
                 case parseCallArgs rest of
                   Nothing ->
-                    goText st painted False False False rest (acc <> TB.fromText ident)
+                    goText st painted False False False rest (acc <> BSB.byteString ident)
                   Just (args, restAfter)
                     | length args == length params ->
-                        let body' = substituteParamsBuilder (M.fromList (zip params args)) body
+                        -- Arguments are expanded in the caller's paint context,
+                        -- before @ident@ is painted, so a nested call to the
+                        -- same macro inside an argument still expands.
+                        let macroArgs = map (macroArg st painted) args
+                            body' = substituteMacroArgs (M.fromList (zip params macroArgs)) body
                             painted' = S.insert ident painted
-                            expanded = builderToText (goText st painted' False False False body' mempty)
-                         in goText st painted False False False restAfter (acc <> TB.fromText expanded)
+                            expanded = builderToBytes (goText st painted' False False False body' mempty)
+                         in goText st painted False False False restAfter (acc <> BSB.byteString expanded)
                     | otherwise ->
-                        goText st painted False False False rest (acc <> TB.fromText ident)
+                        goText st painted False False False rest (acc <> BSB.byteString ident)
               Nothing ->
-                goText st painted False False False rest (acc <> TB.fromText ident)
+                goText st painted False False False rest (acc <> BSB.byteString ident)
+
+-- | A function-like macro argument in both the forms the replacement list
+-- can need: the raw spelling (used by @#@ and @##@, which see arguments
+-- unexpanded) and the macro-expanded spelling (used everywhere else).
+data MacroArg = MacroArg
+  { macroArgRaw :: !ByteString,
+    macroArgExpanded :: !ByteString
+  }
+
+-- | Build a 'MacroArg' by expanding the argument text in the paint context of
+-- the call site.
+macroArg :: EngineState -> Set ByteString -> ByteString -> MacroArg
+macroArg st painted raw =
+  MacroArg raw (builderToBytes (goText st painted False False False raw mempty))
 
 -- | Normalize comments inside object-like macro replacement text while
 -- preserving string and char literals. cpphs replaces @/* ... */@ with spaces
 -- matching the width of the comment body, but treats empty @/**/@ as a token
 -- pasting hack with zero width.
-normalizeObjectReplacement :: Text -> Text
-normalizeObjectReplacement = T.stripEnd . go False False False mempty
+normalizeObjectReplacement :: ByteString -> ByteString
+normalizeObjectReplacement = C.dropWhileEnd isSpaceChar . go False False False mempty
   where
-    go :: Bool -> Bool -> Bool -> TB.Builder -> Text -> Text
-    go _ _ _ acc txt | T.null txt = builderToText acc
+    go :: Bool -> Bool -> Bool -> BSB.Builder -> ByteString -> ByteString
+    go _ _ _ acc txt | C.null txt = builderToBytes acc
     go inString inChar escaped acc txt =
-      case T.uncons txt of
-        Nothing -> builderToText acc
+      case C.uncons txt of
+        Nothing -> builderToBytes acc
         Just (c, rest)
           | inString ->
               let escaped' = c == '\\' && not escaped
                   inString' = not (c == '"' && not escaped)
-               in go inString' False escaped' (acc <> TB.singleton c) rest
+               in go inString' False escaped' (acc <> BSB.char8 c) rest
           | inChar ->
               let escaped' = c == '\\' && not escaped
                   inChar' = not (c == '\'' && not escaped)
-               in go False inChar' escaped' (acc <> TB.singleton c) rest
-          | c == '"' -> go True False False (acc <> TB.singleton c) rest
-          | c == '\'' -> go False True False (acc <> TB.singleton c) rest
-          | "/*" `T.isPrefixOf` txt ->
+               in go False inChar' escaped' (acc <> BSB.char8 c) rest
+          | c == '"' -> go True False False (acc <> BSB.char8 c) rest
+          | c == '\'' -> go False True False (acc <> BSB.char8 c) rest
+          | "/*" `C.isPrefixOf` txt ->
               let (commentText, remaining) = consumeCBlockComment txt
                   replacement = commentReplacement commentText
-               in go False False False (acc <> TB.fromText replacement) remaining
+               in go False False False (acc <> BSB.byteString replacement) remaining
           | otherwise ->
-              go False False False (acc <> TB.singleton c) rest
+              go False False False (acc <> BSB.char8 c) rest
 
-consumeCBlockComment :: Text -> (Text, Text)
+consumeCBlockComment :: ByteString -> (ByteString, ByteString)
 consumeCBlockComment txt =
-  let afterOpen = T.drop 2 txt
-      (inside, suffix) = T.breakOn "*/" afterOpen
-   in if T.null suffix
+  let afterOpen = C.drop 2 txt
+      (inside, suffix) = BS.breakSubstring "*/" afterOpen
+   in if C.null suffix
         then (txt, "")
-        else ("/*" <> inside <> "*/", T.drop 2 suffix)
+        else ("/*" <> inside <> "*/", C.drop 2 suffix)
 
-commentReplacement :: Text -> Text
+commentReplacement :: ByteString -> ByteString
 commentReplacement commentText
   | commentText == "/**/" = ""
-  | otherwise = T.replicate (T.length (commentBody commentText)) " "
+  | otherwise = C.replicate (charWidth (commentBody commentText)) ' '
 
-commentBody :: Text -> Text
+-- | Number of characters in a UTF-8 buffer, for column alignment: count
+-- every byte that is not a UTF-8 continuation byte. On valid UTF-8 this
+-- is the character count; on anything else it degrades gracefully instead
+-- of failing, and on ASCII it is just the length.
+charWidth :: ByteString -> Int
+charWidth = BS.foldl' step 0
+  where
+    step !n b = if b .&. 0xC0 == 0x80 then n else n + 1
+
+commentBody :: ByteString -> ByteString
 commentBody commentText =
-  if "/*" `T.isPrefixOf` commentText && "*/" `T.isSuffixOf` commentText
-    then T.dropEnd 2 (T.drop 2 commentText)
-    else T.drop 2 commentText
+  if "/*" `C.isPrefixOf` commentText && "*/" `C.isSuffixOf` commentText
+    then C.take (C.length commentText - 4) (C.drop 2 commentText)
+    else C.drop 2 commentText
 
 -- | Parse function-like macro call arguments.
-parseCallArgs :: Text -> Maybe ([Text], Text)
+parseCallArgs :: ByteString -> Maybe ([ByteString], ByteString)
 parseCallArgs input = do
-  ('(', rest) <- T.uncons (T.dropWhile isSpace input)
+  ('(', rest) <- C.uncons (C.dropWhile isSpaceChar input)
   parseArgs False False False 0 [] mempty rest
 
-parseArgs :: Bool -> Bool -> Bool -> Int -> [Text] -> TB.Builder -> Text -> Maybe ([Text], Text)
+parseArgs :: Bool -> Bool -> Bool -> Int -> [ByteString] -> BSB.Builder -> ByteString -> Maybe ([ByteString], ByteString)
 parseArgs inString inChar escaped depth argsRev current remaining =
-  case T.uncons remaining of
+  case C.uncons remaining of
     Nothing -> Nothing
     Just (ch, rest)
       | inString ->
           let escaped' = ch == '\\' && not escaped
               inString' = not (ch == '"' && not escaped)
-           in parseArgs inString' False escaped' depth argsRev (current <> TB.singleton ch) rest
+           in parseArgs inString' False escaped' depth argsRev (current <> BSB.char8 ch) rest
       | inChar ->
           let escaped' = ch == '\\' && not escaped
               inChar' = not (ch == '\'' && not escaped)
-           in parseArgs False inChar' escaped' depth argsRev (current <> TB.singleton ch) rest
+           in parseArgs False inChar' escaped' depth argsRev (current <> BSB.char8 ch) rest
       | startsHsBlockComment remaining ->
           let (commentText, afterComment) = consumeHsBlockComment remaining
-           in parseArgs False False False depth argsRev (current <> TB.fromText commentText) afterComment
+           in parseArgs False False False depth argsRev (current <> BSB.byteString commentText) afterComment
       | ch == '"' ->
-          parseArgs True False False depth argsRev (current <> TB.singleton ch) rest
+          parseArgs True False False depth argsRev (current <> BSB.char8 ch) rest
       | ch == '\'' ->
-          parseArgs False True False depth argsRev (current <> TB.singleton ch) rest
+          parseArgs False True False depth argsRev (current <> BSB.char8 ch) rest
       | ch == '(' ->
-          parseArgs False False False (depth + 1) argsRev (current <> TB.singleton ch) rest
+          parseArgs False False False (depth + 1) argsRev (current <> BSB.char8 ch) rest
       | ch == ')' && depth > 0 ->
-          parseArgs False False False (depth - 1) argsRev (current <> TB.singleton ch) rest
+          parseArgs False False False (depth - 1) argsRev (current <> BSB.char8 ch) rest
       | ch == ')' && depth == 0 ->
-          let arg = trimSpacesText (builderToText current)
+          let arg = trimSpacesBytes (builderToBytes current)
               argsRev' =
-                if T.null arg && null argsRev
+                if C.null arg && null argsRev
                   then [""]
                   else arg : argsRev
            in Just (reverse argsRev', rest)
       | ch == ',' && depth == 0 ->
-          let arg = trimSpacesText (builderToText current)
+          let arg = trimSpacesBytes (builderToBytes current)
            in parseArgs False False False depth (arg : argsRev) mempty rest
       | ch == '-' && depth == 0,
-        Just ('-', afterDash) <- T.uncons rest ->
+        Just ('-', afterDash) <- C.uncons rest ->
           -- Haskell line comment inside arg list: close the arg, find ')' in comment
           let commentText = "--" <> afterDash
            in case findLastCloseParen commentText of
                 Nothing -> Nothing
                 Just (commentPrefix, afterClose) ->
-                  let currentText = builderToText current
-                      arg = trimSpacesText currentText
-                      trailingWS = T.takeWhileEnd isSpace currentText
-                      argsRev' = if T.null arg && null argsRev then [""] else arg : argsRev
+                  let currentText = builderToBytes current
+                      arg = trimSpacesBytes currentText
+                      trailingWS = C.takeWhileEnd isSpaceChar currentText
+                      argsRev' = if C.null arg && null argsRev then [""] else arg : argsRev
                    in Just (reverse argsRev', trailingWS <> commentPrefix <> afterClose)
       | otherwise ->
-          parseArgs False False False depth argsRev (current <> TB.singleton ch) rest
+          parseArgs False False False depth argsRev (current <> BSB.char8 ch) rest
 
 -- | Find the last ')' in text and split before it.
-findLastCloseParen :: Text -> Maybe (Text, Text)
+findLastCloseParen :: ByteString -> Maybe (ByteString, ByteString)
 findLastCloseParen txt =
-  case T.findIndex (== ')') (T.reverse txt) of
+  case C.elemIndexEnd ')' txt of
     Nothing -> Nothing
-    Just revIdx ->
-      let idx = T.length txt - revIdx - 1
-       in Just (T.take idx txt, T.drop (idx + 1) txt)
+    Just idx -> Just (C.take idx txt, C.drop (idx + 1) txt)
 
-startsHsBlockComment :: Text -> Bool
+startsHsBlockComment :: ByteString -> Bool
 startsHsBlockComment txt =
-  case T.uncons txt of
+  case C.uncons txt of
     Just ('{', rest) ->
-      case T.uncons rest of
+      case C.uncons rest of
         Just ('-', rest') ->
-          case T.uncons rest' of
+          case C.uncons rest' of
             Just ('#', _) -> False
             _ -> True
         _ -> False
     _ -> False
 
-consumeHsBlockComment :: Text -> (Text, Text)
+consumeHsBlockComment :: ByteString -> (ByteString, ByteString)
 consumeHsBlockComment = go 0 mempty
   where
-    go :: Int -> TB.Builder -> Text -> (Text, Text)
+    go :: Int -> BSB.Builder -> ByteString -> (ByteString, ByteString)
     go depth acc txt =
-      case T.uncons txt of
-        Nothing -> (builderToText acc, "")
+      case C.uncons txt of
+        Nothing -> (builderToBytes acc, "")
         Just (c, rest) ->
-          case T.uncons rest of
+          case C.uncons rest of
             Just ('-', rest')
               | c == '{' ->
-                  go (depth + 1) (acc <> TB.fromText "{-") rest'
+                  go (depth + 1) (acc <> BSB.byteString "{-") rest'
             Just ('}', rest')
               | c == '-' && depth <= 1 ->
-                  (builderToText (acc <> TB.fromText "-}"), rest')
+                  (builderToBytes (acc <> BSB.byteString "-}"), rest')
             Just ('}', rest')
               | c == '-' ->
-                  go (depth - 1) (acc <> TB.fromText "-}") rest'
+                  go (depth - 1) (acc <> BSB.byteString "-}") rest'
             _ ->
-              go depth (acc <> TB.singleton c) rest
+              go depth (acc <> BSB.char8 c) rest
 
 data Piece
-  = PieceWhitespace !Text
+  = PieceWhitespace !ByteString
   | PiecePaste
-  | PieceRaw !Text
-  | PieceParam !Text
+  | PieceRaw !ByteString
+  | PieceParam !ByteString
 
-substituteParams :: Map Text Text -> Text -> Text
-substituteParams = substituteParamsBuilder
+substituteParams :: Map ByteString ByteString -> ByteString -> ByteString
+substituteParams subs = substituteMacroArgs (M.map (\arg -> MacroArg arg arg) subs)
 
 -- | Builder-based parameter substitution. Replaces identifiers found
 -- in the substitution map, respecting string and char literals.
-substituteParamsBuilder :: Map Text Text -> Text -> Text
-substituteParamsBuilder subs = renderPieces . collapseTokenPastes . collapseStringizing . tokenizeReplacementList
+--
+-- Parameters render as their macro-expanded argument, except as operands of
+-- @#@ and @##@, which use the raw argument text.
+substituteMacroArgs :: Map ByteString MacroArg -> ByteString -> ByteString
+substituteMacroArgs subs = renderPieces . collapseTokenPastes . collapseStringizing . tokenizeReplacementList
   where
-    tokenizeReplacementList :: Text -> [Piece]
+    tokenizeReplacementList :: ByteString -> [Piece]
     tokenizeReplacementList txt =
-      case T.uncons txt of
+      case C.uncons txt of
         Nothing -> []
         Just (c, rest)
-          | isSpace c ->
-              let (spaces, remaining) = T.span isSpace txt
+          | isSpaceChar c ->
+              let (spaces, remaining) = C.span isSpaceChar txt
                in PieceWhitespace spaces : tokenizeReplacementList remaining
           | c == '"' ->
               let (literal, remaining) = scanQuoted '"' txt
@@ -389,37 +419,37 @@ substituteParamsBuilder subs = renderPieces . collapseTokenPastes . collapseStri
           | c == '\'' ->
               let (literal, remaining) = scanQuoted '\'' txt
                in PieceRaw literal : tokenizeReplacementList remaining
-          | "/*" `T.isPrefixOf` txt ->
+          | "/*" `C.isPrefixOf` txt ->
               let (commentText, remaining) = consumeCBlockComment txt
                   piece = if commentText == "/**/" then PiecePaste else PieceWhitespace (commentReplacement commentText)
                in piece : tokenizeReplacementList remaining
-          | "##" `T.isPrefixOf` txt ->
-              PiecePaste : tokenizeReplacementList (T.drop 2 txt)
+          | "##" `C.isPrefixOf` txt ->
+              PiecePaste : tokenizeReplacementList (C.drop 2 txt)
           | isIdentStart c ->
-              let (ident, remaining) = T.span isIdentChar txt
+              let (ident, remaining) = C.span isIdentChar txt
                   piece = if M.member ident subs then PieceParam ident else PieceRaw ident
                in piece : tokenizeReplacementList remaining
           | otherwise ->
-              PieceRaw (T.singleton c) : tokenizeReplacementList rest
+              PieceRaw (C.singleton c) : tokenizeReplacementList rest
 
-    scanQuoted :: Char -> Text -> (Text, Text)
+    scanQuoted :: Char -> ByteString -> (ByteString, ByteString)
     scanQuoted quote = go False mempty
       where
         go escaped acc remaining =
-          case T.uncons remaining of
-            Nothing -> (builderToText acc, "")
+          case C.uncons remaining of
+            Nothing -> (builderToBytes acc, "")
             Just (c, rest)
               | c == quote && not escaped ->
-                  (builderToText (acc <> TB.singleton c), rest)
+                  (builderToBytes (acc <> BSB.char8 c), rest)
               | c == '\\' ->
-                  go (not escaped) (acc <> TB.singleton c) rest
+                  go (not escaped) (acc <> BSB.char8 c) rest
               | otherwise ->
-                  go False (acc <> TB.singleton c) rest
+                  go False (acc <> BSB.char8 c) rest
 
     collapseStringizing :: [Piece] -> [Piece]
     collapseStringizing [] = []
     collapseStringizing (PieceRaw "#" : PieceParam name : rest) =
-      PieceRaw (stringizeArgument (lookupParam name)) : collapseStringizing rest
+      PieceRaw (stringizeArgument (lookupParamRaw name)) : collapseStringizing rest
     collapseStringizing (PieceRaw "#" : rest) =
       PieceRaw "#" : collapseStringizing rest
     collapseStringizing (piece : rest) = piece : collapseStringizing rest
@@ -435,7 +465,7 @@ substituteParamsBuilder subs = renderPieces . collapseTokenPastes . collapseStri
                   (leadingSpace, restAfterSpace) = span isWhitespacePiece rest
                in case (unsnoc accNoSpace, restAfterSpace) of
                     (Just (accInit, leftPiece), rightPiece : remaining) ->
-                      go (accInit <> [PieceRaw (renderPiece leftPiece <> renderPiece rightPiece)]) remaining
+                      go (accInit <> [PieceRaw (renderPieceRaw leftPiece <> renderPieceRaw rightPiece)]) remaining
                     _ -> go (acc <> [PieceRaw "##"] <> leadingSpace) restAfterSpace
             _ -> go (acc <> [piece]) rest
 
@@ -455,77 +485,90 @@ substituteParamsBuilder subs = renderPieces . collapseTokenPastes . collapseStri
     isWhitespacePiece (PieceWhitespace _) = True
     isWhitespacePiece _ = False
 
-    lookupParam :: Text -> Text
-    lookupParam name = M.findWithDefault name name subs
+    lookupParamWith :: (MacroArg -> ByteString) -> ByteString -> ByteString
+    lookupParamWith field name = maybe name field (M.lookup name subs)
 
-    renderPieces :: [Piece] -> Text
-    renderPieces = T.concat . map renderPiece
+    lookupParamRaw :: ByteString -> ByteString
+    lookupParamRaw = lookupParamWith macroArgRaw
 
-    renderPiece :: Piece -> Text
-    renderPiece piece =
+    renderPieces :: [Piece] -> ByteString
+    renderPieces = C.concat . map renderPiece
+
+    renderPiece :: Piece -> ByteString
+    renderPiece = renderPieceWith macroArgExpanded
+
+    -- \| Render an operand of @##@, which sees the raw argument text.
+    renderPieceRaw :: Piece -> ByteString
+    renderPieceRaw = renderPieceWith macroArgRaw
+
+    renderPieceWith :: (MacroArg -> ByteString) -> Piece -> ByteString
+    renderPieceWith field piece =
       case piece of
         PieceWhitespace txt -> txt
         PiecePaste -> "##"
         PieceRaw txt -> txt
-        PieceParam name -> lookupParam name
+        PieceParam name -> lookupParamWith field name
 
-    stringizeArgument :: Text -> Text
+    stringizeArgument :: ByteString -> ByteString
     stringizeArgument arg =
       let normalized = normalizeWhitespace arg
-          escaped = T.concatMap escapeStringChar normalized
-       in T.cons '"' (T.snoc escaped '"')
+          escaped = C.concatMap escapeStringChar normalized
+       in C.cons '"' (C.snoc escaped '"')
 
-    normalizeWhitespace :: Text -> Text
-    normalizeWhitespace = T.unwords . T.words
+    -- Not 'C.words'/'C.unwords': those treat byte 0xA0 as whitespace and
+    -- would split a multi-byte character down the middle.
+    normalizeWhitespace :: ByteString -> ByteString
+    normalizeWhitespace =
+      C.intercalate " " . filter (not . C.null) . C.splitWith isSpaceChar
 
-    escapeStringChar :: Char -> Text
+    escapeStringChar :: Char -> ByteString
     escapeStringChar '"' = "\\\""
     escapeStringChar '\\' = "\\\\"
-    escapeStringChar c = T.singleton c
+    escapeStringChar c = C.singleton c
 
-evalCondition :: EngineState -> Text -> Bool
+evalCondition :: EngineState -> ByteString -> Bool
 evalCondition st expr = eval expr /= 0
   where
     macros = stMacros st
     eval = evalNumeric . replaceRemainingWithZero . expandMacros st . replaceDefined macros
 
-evalNumeric :: Text -> Integer
+evalNumeric :: ByteString -> Integer
 evalNumeric input =
   let tokens = tokenize input
    in case parseExpr tokens of
         (val, _) -> val
 
-data Token = TOp Text | TNum Integer | TIdent Text | TOpenParen | TCloseParen deriving (Show)
+data Token = TOp ByteString | TNum Integer | TIdent ByteString | TOpenParen | TCloseParen deriving (Show)
 
-tokenize :: Text -> [Token]
+tokenize :: ByteString -> [Token]
 tokenize input =
-  case T.uncons input of
+  case C.uncons input of
     Nothing -> []
     Just (c, rest)
-      | isSpace c ->
-          tokenize (T.dropWhile isSpace rest)
+      | isSpaceChar c ->
+          tokenize (C.dropWhile isSpaceChar rest)
       | isDigit c ->
-          let (num, remaining) = T.span isDigit input
-           in case TR.decimal num of
-                Right (value, _) -> TNum value : tokenize remaining
-                Left _ -> tokenize remaining
+          let (num, remaining) = C.span isDigit input
+           in case C.readInteger num of
+                Just (value, _) -> TNum value : tokenize remaining
+                Nothing -> tokenize remaining
       | isIdentStart c ->
-          let (ident, remaining) = T.span isIdentChar input
+          let (ident, remaining) = C.span isIdentChar input
            in TIdent ident : tokenize remaining
       | c == '(' ->
           TOpenParen : tokenize rest
       | c == ')' ->
           TCloseParen : tokenize rest
       | otherwise ->
-          let (op, remaining) = T.span isOpChar input
-           in if T.null op
+          let (op, remaining) = C.span isOpChar input
+           in if C.null op
                 then tokenize rest
                 else TOp op : tokenize remaining
 
 parseExpr :: [Token] -> (Integer, [Token])
 parseExpr = parseOr
 
-binary :: ([Token] -> (Integer, [Token])) -> [Text] -> [Token] -> (Integer, [Token])
+binary :: ([Token] -> (Integer, [Token])) -> [ByteString] -> [Token] -> (Integer, [Token])
 binary next ops ts =
   let (v1, ts1) = next ts
    in go v1 ts1
@@ -574,32 +617,32 @@ parseAtom (TOpenParen : ts) =
         _ -> (v, ts1)
 parseAtom ts = (0, ts)
 
-replaceDefined :: Map Text MacroDef -> Text -> Text
+replaceDefined :: Map ByteString MacroDef -> ByteString -> ByteString
 replaceDefined macros = go
   where
     go txt =
-      case T.uncons txt of
+      case C.uncons txt of
         Nothing -> ""
         Just (c, rest)
-          | "defined" `T.isPrefixOf` txt && not (nextCharIsIdent (T.drop 7 txt)) ->
-              expandDefined (T.dropWhile isSpace (T.drop 7 txt))
+          | "defined" `C.isPrefixOf` txt && not (nextCharIsIdent (C.drop 7 txt)) ->
+              expandDefined (C.dropWhile isSpaceChar (C.drop 7 txt))
           | otherwise ->
-              T.cons c (go rest)
+              C.cons c (go rest)
 
     expandDefined rest =
-      case T.uncons rest of
+      case C.uncons rest of
         Just ('(', restAfterOpen) ->
-          let rest' = T.dropWhile isSpace restAfterOpen
-              (name, restAfterName0) = T.span isIdentChar rest'
-              restAfterName = T.dropWhile isSpace restAfterName0
-           in case T.uncons restAfterName of
+          let rest' = C.dropWhile isSpaceChar restAfterOpen
+              (name, restAfterName0) = C.span isIdentChar rest'
+              restAfterName = C.dropWhile isSpaceChar restAfterName0
+           in case C.uncons restAfterName of
                 Just (')', restAfterClose) ->
                   boolLiteral (M.member name macros) <> go restAfterClose
                 _ ->
                   boolLiteral False <> go restAfterName
         _ ->
-          let (name, restAfterName) = T.span isIdentChar rest
-           in if T.null name
+          let (name, restAfterName) = C.span isIdentChar rest
+           in if C.null name
                 then boolLiteral False <> go rest
                 else boolLiteral (M.member name macros) <> go restAfterName
 
@@ -607,25 +650,25 @@ replaceDefined macros = go
     boolLiteral False = " 0 "
 
     nextCharIsIdent remaining =
-      case T.uncons remaining of
+      case C.uncons remaining of
         Just (c, _) -> isIdentChar c
         Nothing -> False
 
-replaceRemainingWithZero :: Text -> Text
+replaceRemainingWithZero :: ByteString -> ByteString
 replaceRemainingWithZero = go
   where
     go txt =
-      case T.uncons txt of
+      case C.uncons txt of
         Nothing -> ""
         Just (c, rest)
           | isIdentStart c ->
-              let (_, remaining) = T.span isIdentChar txt
+              let (_, remaining) = C.span isIdentChar txt
                in " 0 " <> go remaining
           | otherwise ->
-              T.cons c (go rest)
+              C.cons c (go rest)
 
-builderToText :: TB.Builder -> Text
-builderToText = TL.toStrict . TB.toLazyText
+builderToBytes :: BSB.Builder -> ByteString
+builderToBytes = BSL.toStrict . BSB.toLazyByteString
 
-trimSpacesText :: Text -> Text
-trimSpacesText = T.dropWhileEnd isSpace . T.dropWhile isSpace
+trimSpacesBytes :: ByteString -> ByteString
+trimSpacesBytes = C.dropWhileEnd isSpaceChar . C.dropWhile isSpaceChar

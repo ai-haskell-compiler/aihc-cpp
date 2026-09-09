@@ -17,6 +17,8 @@ import Data.List (dropWhileEnd)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
+import qualified Data.Text.Encoding.Error as TEE
 import qualified Data.Text.IO as TIO
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import Language.Preprocessor.Cpphs (BoolOptions (..), CpphsOptions (..), defaultCpphsOptions, runCpphs)
@@ -170,7 +172,9 @@ runOurs sourcePath source = do
   result <- drive (preprocess defaultConfig {configInputFile = sourcePath} source)
   let errors = [diagMessage d | d <- resultDiagnostics result, diagSeverity d == Error]
   case errors of
-    [] -> pure (Right (resultOutput result))
+    -- The oracle is 'String'-based, so compare decoded text. Fixtures are
+    -- all ASCII; byte-exactness of the output is covered in Spec.hs.
+    [] -> pure (Right (TE.decodeUtf8With TEE.lenientDecode (resultOutput result)))
     (msg : _) -> pure (Left (T.unpack msg))
   where
     drive (Done result) = pure result

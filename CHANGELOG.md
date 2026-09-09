@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** the preprocessor is now agnostic to the source encoding.
+  `resultOutput` is a `ByteString` rather than `Text`, and `configMacros`
+  is keyed by `ByteString`. Bytes the preprocessor did not generate itself
+  are copied from input to output verbatim, so a module in any encoding —
+  or in no consistent encoding — passes through unchanged. Nothing but
+  `Diagnostic` message text is ever decoded.
+
+  To migrate, decode at the boundary if you want `Text`:
+  `Data.Text.Encoding.decodeUtf8With Data.Text.Encoding.Error.lenientDecode (resultOutput r)`.
+
+### Fixed
+
+- `preprocess` no longer throws an impure exception on source that is not
+  valid UTF-8 (for example a Latin-1 encoded module containing byte `0xa9`,
+  as shipped in Ebnf2ps). Previously `Data.Text.Encoding.decodeUtf8` raised
+  from inside a pure function, escaping the `Diagnostic` mechanism the API
+  otherwise uses; such bytes now simply pass through. GHC accepts an
+  undecodable byte in a comment and rejects one where a token must be
+  lexed, so this leaves the encoding decision to the compiler front-end
+  instead of failing modules that genuinely compile.
+- Whitespace and identifier classification is now ASCII-only. Using
+  `Data.Char.isSpace` on a byte treated `0xA0` — an ordinary UTF-8
+  continuation byte — as whitespace, which could split a multi-byte
+  character in half.
+- Macro arguments are now expanded before substitution, so a function-like
+  macro invocation produced by an expansion is rescanned and expanded, matching
+  GHC's C preprocessor and `cpphs`. The C standard's non-recursive-expansion
+  rule is honoured, so a macro is never expanded inside its own expansion.
+- A pragma nested inside a Haskell block comment no longer terminates that
+  comment. `{-#` is treated as a pragma delimiter only outside a comment;
+  inside one it counts as an ordinary nested `{-`, balancing the `-}` of the
+  closing `#-}`. Previously each such pragma decremented the comment depth,
+  making CPP directives in the rest of the commented-out region live —
+  producing spurious `unmatched #endif` warnings and, with a commented-out
+  `#if 0`, silently dropping the comment's contents
+  ([#1](https://github.com/ai-haskell-compiler/aihc-cpp/issues/1)).
+
 ## [1.0.0.3] - 2026-07-26
 
 ### Changed

@@ -45,3 +45,10 @@ macro-comment-replacement	macro	macro-comment-replacement.hs	pass
 thyme-lens-comment-paste	macro	thyme-lens-comment-paste.hs	pass
 macro-c-block-comment-literal	macro	macro-c-block-comment-literal.hs	pass
 function-macro-c-block-comment	macro	function-macro-c-block-comment.hs	pass
+nested-function-macro-rescan	macro	nested-function-macro-rescan.hs	pass
+function-macro-arg-rescan	macro	function-macro-arg-rescan.hs	pass
+macro-rescan-repeated-name	macro	macro-rescan-repeated-name.hs	pass
+# Encoding-agnostic passthrough is covered by the "source encoding" tests in
+# test/Spec.hs, not by a fixture here: the cpphs oracle reads its input as
+# locale-decoded String and aborts on bytes it cannot decode, so it cannot
+# act as an oracle for a non-UTF-8 fixture.

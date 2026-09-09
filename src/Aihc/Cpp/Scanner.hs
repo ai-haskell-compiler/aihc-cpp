@@ -21,17 +21,17 @@ import Aihc.Cpp.Cursor
     peekByte2,
     skipNewline,
     skipToInteresting,
-    sliceText,
+    sliceBytes,
   )
 import Aihc.Cpp.Evaluator (expandMacros, expandMacrosMultiline)
 import Aihc.Cpp.Types (EngineState)
-import Data.Text (Text)
-import qualified Data.Text as T
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as C
 import Prelude hiding (null)
 
 data LineSpan = LineSpan
   { lineSpanInBlockComment :: !Bool,
-    lineSpanText :: !Text
+    lineSpanText :: !ByteString
   }
 
 data LineScan = LineScan
@@ -41,9 +41,9 @@ data LineScan = LineScan
   }
 
 -- | Expand macros in a list of line spans (single-line, no lookahead).
-expandLineBySpan :: EngineState -> [LineSpan] -> Text
+expandLineBySpan :: EngineState -> [LineSpan] -> ByteString
 expandLineBySpan st =
-  T.concat . map expandSpan
+  C.concat . map expandSpan
   where
     expandSpan lineChunk
       | lineSpanInBlockComment lineChunk = lineSpanText lineChunk
@@ -57,35 +57,35 @@ expandLineBySpan st =
 -- Multi-line expansion is only attempted for lines that consist entirely
 -- of code spans (no inline comments). Mixed code/comment lines use
 -- single-line expansion to preserve comment span positions.
-expandLineBySpanMultiline :: EngineState -> [LineSpan] -> Cursor -> (Text, Int)
+expandLineBySpanMultiline :: EngineState -> [LineSpan] -> Cursor -> (ByteString, Int)
 expandLineBySpanMultiline st spans futureCursor =
   let commentSpans = filter lineSpanInBlockComment spans
-      hasLineComment = any (\s -> "--" `T.isPrefixOf` lineSpanText s) commentSpans
-      hasCBlockComment = any (T.all (== ' ') . lineSpanText) commentSpans
+      hasLineComment = any (\s -> "--" `C.isPrefixOf` lineSpanText s) commentSpans
+      hasCBlockComment = any (C.all (== ' ') . lineSpanText) commentSpans
       hasHsComment = case commentSpans of
         [] -> False
         _ -> not hasCBlockComment
    in if hasLineComment || hasHsComment
         then -- Haskell comments stay in the token stream, so expand the full line.
-          let fullText = T.concat [lineSpanText s | s <- spans]
+          let fullText = C.concat [lineSpanText s | s <- spans]
            in (expandMacros st fullText, 0)
         else
           if hasCBlockComment
             then -- C comments are stripped to spaces, so preserve per-span handling.
               (expandLineBySpan st spans, 0)
             else -- Pure code line: try multi-line expansion
-              let codeText = T.concat [lineSpanText s | s <- spans]
+              let codeText = C.concat [lineSpanText s | s <- spans]
                   futureCodeLines = cursorToLines futureCursor
                in expandMacrosMultiline st codeText futureCodeLines
 
--- | Extract lines from a cursor as a lazy list of Text values.
--- Each line is the text up to the next newline (or EOF).
-cursorToLines :: Cursor -> [Text]
+-- | Extract lines from a cursor as a lazy list of byte slices.
+-- Each line is the content up to the next newline (or EOF).
+cursorToLines :: Cursor -> [ByteString]
 cursorToLines !cur
   | null cur = []
   | otherwise =
       let eol = findNewline cur
-          lineText = sliceText (curPos cur) (curPos eol) cur
+          lineText = sliceBytes (curPos cur) (curPos eol) cur
        in lineText : maybe [] cursorToLines (skipNewline eol)
 
 -- | Lightweight scan that only tracks block comment depth changes.
@@ -116,9 +116,12 @@ scanLineDepthOnly = goDepth
               | b1 == 0x7B && b2 == 0x2D -> -- '{-'
                   let cur' = advance2 cur
                    in case peekByte cur' of
-                        Just 0x23 ->
-                          -- {-# is a pragma, not a comment
-                          goDepth hsDepth cDepth (advance cur)
+                        Just 0x23
+                          | hsDepth == 0 ->
+                              -- {-# is a pragma, not a comment (only at depth 0;
+                              -- inside a comment it is an ordinary nested opener,
+                              -- balancing the -} of its closing #-})
+                              goDepth hsDepth cDepth (advance cur)
                         _ ->
                           goDepth (hsDepth + 1) cDepth cur'
               | hsDepth == 0 && b1 == 0x2F && b2 == 0x2A -> -- '/*'
@@ -130,14 +133,14 @@ scanLineDepthOnly = goDepth
 
 -- | Scan a line, tracking comment depths and splitting into spans that are
 -- either inside or outside block comments. Uses a byte-level cursor for
--- efficient scanning instead of character-by-character T.uncons/T.cons.
+-- efficient scanning instead of character-by-character uncons/cons.
 --
 -- Accepts a 'Cursor' positioned at the start of the line content.
 -- The cursor should be bounded to the line (e.g., via 'lineSlice').
 --
 -- The scanner splits the line into 'LineSpan' segments. Each segment is
 -- tagged with whether it is inside a block comment. Code spans (outside
--- comments) are zero-copy slices of the UTF-8 encoded input. C89 comment
+-- comments) are zero-copy slices of the raw input. C89 comment
 -- content is replaced with spaces to preserve column alignment.
 scanLine :: Int -> Int -> Cursor -> LineScan
 scanLine hsDepth0 cDepth0 cursor0 =
@@ -162,7 +165,7 @@ scanLine hsDepth0 cDepth0 cursor0 =
     emit :: [LineSpan] -> Int -> Int -> Cursor -> Bool -> [LineSpan]
     emit acc start end cur inComment
       | start >= end = acc
-      | otherwise = LineSpan inComment (sliceText start end cur) : acc
+      | otherwise = LineSpan inComment (sliceBytes start end cur) : acc
     {-# INLINE emit #-}
 
     go ::
@@ -243,7 +246,7 @@ scanLine hsDepth0 cDepth0 cursor0 =
                       && b2 == 0x2D -- '--'
                       then
                         let acc' = emit acc spanStart (curPos cur) cur spanInComment
-                            restText = sliceText (curPos cur) (bufLength cur) cur
+                            restText = sliceBytes (curPos cur) (bufLength cur) cur
                          in (LineSpan True restText : acc', hsDepth, cDepth)
                       -- === Inside string literal ===
                       else
@@ -324,25 +327,27 @@ scanLine hsDepth0 cDepth0 cursor0 =
                                                   (curPos cur')
                                                   inCommentAfter
                                                   cur'
-                                          -- === Start of Haskell block comment: {- (but not {-#) ===
+                                          -- === Start of Haskell block comment: {- (but not a top-level {-# pragma) ===
                                           else
                                             if b1 == 0x7B && b2 == 0x2D -- '{-'
                                               then
                                                 let cur' = advance2 cur
                                                  in case peekByte cur' of
-                                                      Just 0x23 ->
-                                                        -- '#' => pragma {-#, not a block comment
-                                                        -- Advance past '{' only, continue in same mode
-                                                        go
-                                                          hsDepth
-                                                          cDepth
-                                                          False
-                                                          False
-                                                          False
-                                                          acc
-                                                          spanStart
-                                                          spanInComment
-                                                          (advance cur)
+                                                      Just 0x23
+                                                        | hsDepth == 0 ->
+                                                            -- '#' => pragma {-#, not a block comment
+                                                            -- (only outside comments; nested {-# opens)
+                                                            -- Advance past '{' only, continue in same mode
+                                                            go
+                                                              hsDepth
+                                                              cDepth
+                                                              False
+                                                              False
+                                                              False
+                                                              acc
+                                                              spanStart
+                                                              spanInComment
+                                                              (advance cur)
                                                       _ ->
                                                         -- Flush any text before {-, emit {- as comment
                                                         let acc' = emit acc spanStart (curPos cur) cur spanInComment

@@ -1,5 +1,14 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- |
+-- Module      : Aihc.Cpp.Parser
+-- Description : Directive parsing over raw bytes
+-- License     : Unlicense
+--
+-- Directives are parsed straight from the input bytes. Every character
+-- that is significant to the C preprocessor is ASCII, so no decoding is
+-- required; bytes >= 0x80 are only ever carried along inside identifiers,
+-- macro bodies and message text.
 module Aihc.Cpp.Parser
   ( Directive (..),
     parseDirective,
@@ -8,54 +17,56 @@ module Aihc.Cpp.Parser
     parseInclude,
     parseLineDirective,
     parseIdentifier,
-    parseQuotedText,
+    parseQuoted,
     parseDefineParams,
     isIdentStart,
     isIdentChar,
     isOpChar,
+    isSpaceChar,
+    strip,
+    stripStart,
   )
 where
 
 import Aihc.Cpp.Types (IncludeKind (..))
-import Data.Char (isAlphaNum, isDigit, isLetter)
-import Data.Text (Text)
-import qualified Data.Text as T
-import qualified Data.Text.Read as TR
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as C
+import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 
 data Directive
-  = DirDefineObject !Text !Text
-  | DirDefineFunction !Text ![Text] !Text
-  | DirUndef !Text
-  | DirInclude !IncludeKind !Text
-  | DirIf !Text
-  | DirIfDef !Text
-  | DirIfNDef !Text
-  | DirElif !Text
+  = DirDefineObject !ByteString !ByteString
+  | DirDefineFunction !ByteString ![ByteString] !ByteString
+  | DirUndef !ByteString
+  | DirInclude !IncludeKind !ByteString
+  | DirIf !ByteString
+  | DirIfDef !ByteString
+  | DirIfNDef !ByteString
+  | DirElif !ByteString
   | DirElse
   | DirEndIf
   | DirLine !Int !(Maybe FilePath)
   | DirPragmaOnce
-  | DirWarning !Text
-  | DirError !Text
-  | DirUnsupported !Text
+  | DirWarning !ByteString
+  | DirError !ByteString
+  | DirUnsupported !ByteString
 
-parseDirective :: Text -> Maybe Directive
+parseDirective :: ByteString -> Maybe Directive
 parseDirective raw =
-  let trimmed = T.stripStart raw
-   in if "#" `T.isPrefixOf` trimmed
+  let trimmed = stripStart raw
+   in if "#" `C.isPrefixOf` trimmed
         then
-          let body = T.stripStart (T.drop 1 trimmed)
-           in case T.uncons body of
-                Just (c, _) | isLetter c || isDigit c -> parseDirectiveBody body
+          let body = stripStart (C.drop 1 trimmed)
+           in case C.uncons body of
+                Just (c, _) | isIdentStart c || isDigit c -> parseDirectiveBody body
                 _ -> Nothing
         else Nothing
 
-parseDirectiveBody :: Text -> Maybe Directive
+parseDirectiveBody :: ByteString -> Maybe Directive
 parseDirectiveBody body =
-  let (name, rest0) = T.span isIdentChar body
-      rest = T.stripStart rest0
-   in if T.null name
-        then case T.uncons body of
+  let (name, rest0) = C.span isIdentChar body
+      rest = stripStart rest0
+   in if C.null name
+        then case C.uncons body of
           Just (c, _) | isDigit c -> parseLineDirective body
           _ -> Nothing
         else case name of
@@ -77,77 +88,106 @@ parseDirectiveBody body =
           "error" -> Just (DirError rest)
           _ -> Nothing
 
-parseLineDirective :: Text -> Maybe Directive
+parseLineDirective :: ByteString -> Maybe Directive
 parseLineDirective body =
-  case TR.decimal body of
-    Left _ -> Nothing
-    Right (lineNumber, rest0) ->
-      let rest = T.stripStart rest0
-       in case parseQuotedText rest of
-            Nothing -> Just (DirLine lineNumber Nothing)
-            Just path -> Just (DirLine lineNumber (Just (T.unpack path)))
-
-parsePragma :: Text -> Maybe Directive
-parsePragma body =
-  case T.words body of
-    ["once"] -> Just DirPragmaOnce
+  case C.uncons body of
+    -- 'C.readInt' also accepts a leading sign; a #line number must not.
+    Just (c, _) | isDigit c ->
+      case C.readInt body of
+        Nothing -> Nothing
+        Just (lineNumber, rest0) ->
+          let rest = stripStart rest0
+           in case parseQuoted rest of
+                Nothing -> Just (DirLine lineNumber Nothing)
+                Just path -> Just (DirLine lineNumber (Just (C.unpack path)))
     _ -> Nothing
 
-parseDefine :: Text -> Maybe Directive
+parsePragma :: ByteString -> Maybe Directive
+parsePragma body =
+  if strip body == "once" then Just DirPragmaOnce else Nothing
+
+parseDefine :: ByteString -> Maybe Directive
 parseDefine rest = do
-  let (name, rest0) = T.span isIdentChar rest
-  if T.null name
+  let (name, rest0) = C.span isIdentChar rest
+  if C.null name
     then Nothing
-    else case T.uncons rest0 of
+    else case C.uncons rest0 of
       Just ('(', afterOpen) ->
         let (params, restAfterParams) = parseDefineParams afterOpen
          in case params of
               Nothing -> Just (DirUnsupported "define-function-macro")
-              Just names -> Just (DirDefineFunction name names (T.stripStart restAfterParams))
-      _ -> Just (DirDefineObject name (T.stripStart rest0))
+              Just names -> Just (DirDefineFunction name names (stripStart restAfterParams))
+      _ -> Just (DirDefineObject name (stripStart rest0))
 
-parseDefineParams :: Text -> (Maybe [Text], Text)
+parseDefineParams :: ByteString -> (Maybe [ByteString], ByteString)
 parseDefineParams input =
-  let (inside, suffix) = T.breakOn ")" input
-   in if T.null suffix
+  let (inside, suffix) = C.break (== ')') input
+   in if C.null suffix
         then (Nothing, "")
         else
-          let rawParams = T.splitOn "," inside
-              params = map (T.takeWhile isIdentChar . T.strip) rawParams
-           in if T.null (T.strip inside)
-                then (Just [], T.drop 1 suffix)
+          let rawParams = C.split ',' inside
+              params = map (C.takeWhile isIdentChar . strip) rawParams
+           in if C.null (strip inside)
+                then (Just [], C.drop 1 suffix)
                 else
-                  if any T.null params
-                    then (Nothing, T.drop 1 suffix)
-                    else (Just params, T.drop 1 suffix)
+                  if any C.null params
+                    then (Nothing, C.drop 1 suffix)
+                    else (Just params, C.drop 1 suffix)
 
-parseIdentifier :: Text -> Maybe Text
+parseIdentifier :: ByteString -> Maybe ByteString
 parseIdentifier txt =
-  let ident = T.takeWhile isIdentChar (T.stripStart txt)
-   in if T.null ident then Nothing else Just ident
+  let ident = C.takeWhile isIdentChar (stripStart txt)
+   in if C.null ident then Nothing else Just ident
 
-parseInclude :: Text -> Maybe Directive
+parseInclude :: ByteString -> Maybe Directive
 parseInclude txt =
-  case T.uncons (T.stripStart txt) of
+  case C.uncons (stripStart txt) of
     Just ('"', rest) ->
-      let (path, suffix) = T.breakOn "\"" rest
-       in if T.null suffix then Nothing else Just (DirInclude IncludeLocal path)
+      let (path, suffix) = C.break (== '"') rest
+       in if C.null suffix then Nothing else Just (DirInclude IncludeLocal path)
     Just ('<', rest) ->
-      let (path, suffix) = T.breakOn ">" rest
-       in if T.null suffix then Nothing else Just (DirInclude IncludeSystem path)
+      let (path, suffix) = C.break (== '>') rest
+       in if C.null suffix then Nothing else Just (DirInclude IncludeSystem path)
     _ -> Nothing
 
-parseQuotedText :: Text -> Maybe Text
-parseQuotedText txt = do
-  ('"', rest) <- T.uncons txt
-  let (path, suffix) = T.breakOn "\"" rest
-  if T.null suffix then Nothing else Just path
+parseQuoted :: ByteString -> Maybe ByteString
+parseQuoted txt = do
+  ('"', rest) <- C.uncons txt
+  let (path, suffix) = C.break (== '"') rest
+  if C.null suffix then Nothing else Just path
 
+-- | ASCII whitespace.
+--
+-- Deliberately not 'Data.Char.isSpace': applied to a byte, that would
+-- classify 0xA0 (Latin-1 NBSP, and a perfectly ordinary UTF-8
+-- continuation byte) as whitespace and split a multi-byte character in
+-- half. For the same reason this module avoids 'C.words' and 'C.strip'.
+isSpaceChar :: Char -> Bool
+isSpaceChar c =
+  c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'
+
+-- | Drop leading ASCII whitespace.
+stripStart :: ByteString -> ByteString
+stripStart = C.dropWhile isSpaceChar
+
+-- | Drop leading and trailing ASCII whitespace.
+strip :: ByteString -> ByteString
+strip = C.dropWhile isSpaceChar . C.dropWhileEnd isSpaceChar
+
+-- | First character of an identifier.
+--
+-- Any byte >= 0x80 qualifies, so a non-ASCII identifier is scanned as one
+-- token regardless of the source encoding, and a byte that decodes to
+-- nothing at all is simply part of whatever token contains it.
 isIdentStart :: Char -> Bool
-isIdentStart c = c == '_' || isLetter c
+isIdentStart c = c == '_' || isAsciiAlpha c || c >= '\x80'
 
+-- | Subsequent characters of an identifier. See 'isIdentStart'.
 isIdentChar :: Char -> Bool
-isIdentChar c = c == '_' || isAlphaNum c
+isIdentChar c = c == '_' || isAsciiAlpha c || isDigit c || c >= '\x80'
+
+isAsciiAlpha :: Char -> Bool
+isAsciiAlpha c = isAsciiLower c || isAsciiUpper c
 
 isOpChar :: Char -> Bool
 isOpChar c =
