@@ -45,10 +45,12 @@ import Control.Monad (foldM)
 import Control.Monad.Trans.Except (runExceptT)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
+import Data.Char (isAlpha, isSpace, toLower)
 import Data.Either (fromRight, rights)
-import Data.List (isPrefixOf, isSuffixOf, sort)
+import Data.List (isPrefixOf, isSuffixOf, sort, sortOn)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe)
+import qualified Data.Text as T
 import GHC.Clock (getMonotonicTime)
 import GHC.Generics (Generic)
 import qualified Hpp
@@ -61,7 +63,7 @@ import Language.Preprocessor.Cpphs
   )
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.Environment (lookupEnv)
-import System.FilePath (splitDirectories, takeDirectory, (</>))
+import System.FilePath (splitDirectories, takeDirectory, takeExtension, (</>))
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stdout)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Tasty.Bench (Benchmark, bench, bgroup, defaultMain, nfIO)
@@ -168,20 +170,26 @@ usesCpp = any isDirective . BS8.lines
     directives =
       ["if", "ifdef", "ifndef", "elif", "else", "endif", "define", "undef", "include"]
 
--- | An input, identified by path.
+-- | An input, identified by path, with the include path it should be given.
 --
 -- Nothing is preloaded. Each tool reads the file inside the timed region and
 -- discards it, so peak memory is one module rather than the whole corpus and
 -- there is no ceiling on how much of a snapshot can be measured. The read is
 -- charged to every tool equally and quantified by the @(read only)@ row.
-newtype Prepared = Prepared {prepPath :: FilePath}
+--
+-- The include path is resolved once here rather than per tool, so all three are
+-- given exactly the same one.
+data Prepared = Prepared
+  { prepPath :: !FilePath,
+    prepSearch :: ![FilePath]
+  }
 
 -- | What one tool did with one module.
 data Outcome = Outcome
   { -- | Bytes of output produced.
     outBytes :: !Int,
     -- | The tool produced output but reported an error in the source.
-    outErrored :: !Bool
+    outError :: !(Maybe String)
   }
   deriving (Generic, NFData)
 
@@ -196,38 +204,40 @@ data Outcome = Outcome
 -- benefits from leaving a lazy structure unevaluated and all three are charged
 -- for producing the whole result, and each converts the input into the shape
 -- its own API demands inside the timed region.
-tools :: [(String, FilePath -> Prepared -> IO Outcome)]
+tools :: [(String, Prepared -> IO Outcome)]
 tools =
   [ ( "aihc-cpp",
-      \root p -> do
+      \p -> do
         source <- BS.readFile (prepPath p)
-        result <- runAihc (searchPath root p) (prepPath p) source
+        result <- runAihc (prepSearch p) (prepPath p) source
         -- aihc-cpp reports a bad directive or an unresolvable include as a
         -- diagnostic and still returns output; hpp and cpphs throw. Reporting
         -- these separately from crashes keeps that difference visible instead
         -- of turning it into a robustness claim in either direction.
-        let errored = any ((== Error) . diagSeverity) (resultDiagnostics result)
-        flip Outcome errored . BS.length <$> evaluate (force (resultOutput result))
+        let firstError = case [d | d <- resultDiagnostics result, diagSeverity d == Error] of
+              (d : _) -> Just (T.unpack (diagMessage d))
+              [] -> Nothing
+        flip Outcome firstError . BS.length <$> evaluate (force (resultOutput result))
     ),
     ( "hpp",
-      \root p -> do
+      \p -> do
         source <- BS.readFile (prepPath p)
-        out <- hpp (searchPath root p) p (BS8.lines source)
-        flip Outcome False . sum . map BS.length <$> evaluate (force out)
+        out <- hpp (prepSearch p) p (BS8.lines source)
+        flip Outcome Nothing . sum . map BS.length <$> evaluate (force out)
     ),
     ( "cpphs",
-      \root p -> do
+      \p -> do
         source <- BS.readFile (prepPath p)
-        out <- runCpphs (cpphsOptions (searchPath root p)) (prepPath p) (BS8.unpack source)
-        flip Outcome False . length <$> evaluate (force out)
+        out <- runCpphs (cpphsOptions (prepSearch p)) (prepPath p) (BS8.unpack source)
+        flip Outcome Nothing . length <$> evaluate (force out)
     ),
     ( "(read only)",
-      \_ p -> flip Outcome False . BS.length <$> BS.readFile (prepPath p)
+      \p -> flip Outcome Nothing . BS.length <$> BS.readFile (prepPath p)
     ),
     ( "(read + String)",
-      \_ p -> do
+      \p -> do
         source <- BS.readFile (prepPath p)
-        flip Outcome False . length <$> evaluate (force (BS8.unpack source))
+        flip Outcome Nothing . length <$> evaluate (force (BS8.unpack source))
     )
   ]
 
@@ -238,14 +248,17 @@ main = do
   case corpus of
     Generated root -> do
       generateCorpus root
-      prepared <- mapM (prepare . (root </>) . caseEntry) corpusCases
-      mapM_ (reportOne root) (zip corpusCases prepared)
+      declared <- packageIncludeDirs root
+      prepared <- mapM (prepare declared root . (root </>) . caseEntry) corpusCases
+      mapM_ reportOne (zip corpusCases prepared)
       defaultMain
-        [ bgroup (caseName c) [bench name (nfIO (run root p)) | (name, run) <- tools]
+        [ bgroup (caseName c) [bench name (nfIO (run p)) | (name, run) <- tools]
         | (c, p) <- zip corpusCases prepared
         ]
     RealWorld root -> do
       warnMissingStubs
+      declared <- packageIncludeDirs root
+      putStrLn ("include-dirs: declared by " <> show (M.size (M.filter (not . null) declared)) <> " packages")
       found <- listHsFiles root
       full <- lookupEnv "AIHC_CPP_BENCH_SWEEP"
       selected <- lookupEnv "AIHC_CPP_BENCH_TOOLS"
@@ -253,12 +266,12 @@ main = do
             Nothing -> tools
             Just names -> [t | t@(name, _) <- tools, name `elem` splitOn ',' names]
       case full of
-        Just _ -> fullSweep root chosen =<< mapM prepare =<< allCppModules found
+        Just _ -> fullSweep chosen =<< mapM (prepare declared root) =<< allCppModules found
         Nothing -> do
           budget <- byteBudget
-          prepared <- mapM prepare =<< selectModules budget found
-          reportCorpus root (length found) prepared
-          defaultMain [bgroup "real-world" (map (sweep root prepared) chosen)]
+          prepared <- mapM (prepare declared root) =<< selectModules budget found
+          reportCorpus (length found) prepared
+          defaultMain [bgroup "real-world" (map (sweep prepared) chosen)]
 
 splitOn :: Char -> String -> [String]
 splitOn sep str = case break (== sep) str of
@@ -272,8 +285,8 @@ splitOn sep str = case break (== sep) str of
 -- answers a different question — how does each tool fare across a whole
 -- snapshot — and so takes one pass over everything and reports wall clock and
 -- throughput rather than a distribution.
-fullSweep :: FilePath -> [(String, FilePath -> Prepared -> IO Outcome)] -> [Prepared] -> IO ()
-fullSweep root chosen prepared = do
+fullSweep :: [(String, Prepared -> IO Outcome)] -> [Prepared] -> IO ()
+fullSweep chosen prepared = do
   corpusBytes <- sum <$> mapM (fmap BS.length . BS.readFile . prepPath) prepared
   putStrLn
     ( "full sweep: "
@@ -300,7 +313,7 @@ fullSweep root chosen prepared = do
       -- Folded strictly, keeping only counters and the first few failures.
       -- Retaining every outcome kept each failure's exception alive, and with
       -- it whatever the exception's message had captured.
-      tally <- foldM (step run) (Tally 0 0 0 0 []) prepared
+      tally <- foldM (step run) (Tally 0 0 0 0 [] M.empty) prepared
       elapsed <- subtract start <$> getMonotonicTime
       let mib = fromIntegral corpusBytes / 1048576 :: Double
       putStrLn
@@ -313,12 +326,19 @@ fullSweep root chosen prepared = do
             <> showFixed 1 (mib / elapsed)
         )
       mapM_ (\msg -> putStrLn ("    " <> msg)) (reverse (tallyFailures tally))
+      mapM_ reportError (take 12 (sortOn (negate . snd) (M.toList (tallyErrors tally))))
+    reportError (msg, n) = putStrLn ("    " <> pad 6 (show n) <> msg)
     step run tally p = do
-      outcome <- tryTool (run root p)
+      outcome <- tryTool (run p)
       pure $! case outcome of
-        Right o
-          | outErrored o -> tally {tallyErrored = tallyErrored tally + 1, tallyBytes = tallyBytes tally + outBytes o}
-          | otherwise -> tally {tallyOk = tallyOk tally + 1, tallyBytes = tallyBytes tally + outBytes o}
+        Right o -> case outError o of
+          Just msg ->
+            tally
+              { tallyErrored = tallyErrored tally + 1,
+                tallyBytes = tallyBytes tally + outBytes o,
+                tallyErrors = M.insertWith (+) (generalise msg) 1 (tallyErrors tally)
+              }
+          Nothing -> tally {tallyOk = tallyOk tally + 1, tallyBytes = tallyBytes tally + outBytes o}
         Left err ->
           tally
             { tallyCrashed = tallyCrashed tally + 1,
@@ -334,13 +354,23 @@ fullSweep root chosen prepared = do
        in show whole <> "." <> pad0 places (show frac)
     pad0 n str = replicate (n - length str) '0' <> str
 
+-- | Collapse the varying part of a diagnostic so like messages group together.
+generalise :: String -> String
+generalise msg = case break (== ':') msg of
+  (prefix, ':' : _) | prefix `elem` grouped -> prefix <> ": <name>"
+  _ -> msg
+  where
+    grouped = ["missing include", "unterminated conditional", "unknown directive"]
+
 -- | Running counts for one tool's pass over the corpus.
 data Tally = Tally
   { tallyOk :: !Int,
     tallyErrored :: !Int,
     tallyCrashed :: !Int,
     tallyBytes :: !Int,
-    tallyFailures :: [String]
+    tallyFailures :: [String],
+    -- | How often each distinct error diagnostic was reported.
+    tallyErrors :: !(M.Map String Int)
   }
 
 -- | Every CPP-using module, with no sampling and no budget.
@@ -358,11 +388,11 @@ allCppModules = fmap reverse . foldM check []
 -- individually, and there are far too many to list separately. Timing the whole
 -- set at once is also the workload that matters — what a build pays across a
 -- project, not what one module costs.
-sweep :: FilePath -> [Prepared] -> (String, FilePath -> Prepared -> IO Outcome) -> Benchmark
-sweep root prepared (name, run) =
+sweep :: [Prepared] -> (String, Prepared -> IO Outcome) -> Benchmark
+sweep prepared (name, run) =
   bench name (nfIO (foldM step 0 prepared))
   where
-    step !acc p = (acc +) <$> safely (run root p)
+    step !acc p = (acc +) <$> safely (run p)
 
 -- | Run a preprocessor, treating a failure of its own as zero output.
 --
@@ -387,28 +417,26 @@ tryTool act = do
     Left err | Just async <- fromException err -> throwIO (async :: AsyncException)
     _ -> pure outcome
 
-prepare :: FilePath -> IO Prepared
-prepare = pure . Prepared
+prepare :: M.Map FilePath [FilePath] -> FilePath -> FilePath -> IO Prepared
+prepare declared root path = pure (Prepared path (searchPathFor declared root path))
 
 -- | Describe the discovered corpus, and how much of it each tool can handle.
-reportCorpus :: FilePath -> Int -> [Prepared] -> IO ()
-reportCorpus root found prepared = do
+reportCorpus :: Int -> [Prepared] -> IO ()
+reportCorpus found prepared = do
   corpusBytes <- sum <$> mapM (fmap BS.length . BS.readFile . prepPath) prepared
   putStrLn
     ( "real-world corpus: "
         <> show (length prepared)
         <> " of "
         <> show found
-        <> " sampled CPP-using modules from "
-        <> root
-        <> ", "
+        <> " sampled CPP-using modules, "
         <> show (corpusBytes `div` 1024)
         <> " KiB (raise AIHC_CPP_BENCH_MAX_BYTES to widen)"
     )
   mapM_ report tools
   where
     report (name, run) = do
-      outcomes <- mapM (\p -> (,) (prepPath p) <$> tryTool (run root p)) prepared
+      outcomes <- mapM (\p -> (,) (prepPath p) <$> tryTool (run p)) prepared
       let failed = [(path, show err) | (path, Left err) <- outcomes]
           produced = sum (map outBytes (rights (map snd outcomes)))
       putStrLn
@@ -431,10 +459,10 @@ reportCorpus root found prepared = do
 --
 -- Not a correctness check. It is here so a wildly faster result is not mistaken
 -- for a win when it is really a tool that gave up early or emitted far less.
-reportOne :: FilePath -> (CorpusCase, Prepared) -> IO ()
-reportOne root (c, p) = do
+reportOne :: (CorpusCase, Prepared) -> IO ()
+reportOne (c, p) = do
   inBytes <- BS.length <$> BS.readFile (prepPath p)
-  sizes <- mapM (\(name, run) -> (,) name <$> safely (run root p)) tools
+  sizes <- mapM (\(name, run) -> (,) name <$> safely (run p)) tools
   putStrLn
     ( caseName c
         <> ": in "
@@ -484,25 +512,6 @@ cpphsOptions dirs =
       defines = [(BS8.unpack name, BS8.unpack value) | (name, value) <- predefinedMacros]
     }
 
--- | Where to look for an @#include@ target, beyond the including file's own
--- directory.
---
--- A real build passes include directories that a bare source tree does not
--- have: the RTS headers GHC ships (stubbed under @bench\/include@) and the
--- package's own @include@ directory, which Cabal adds from @include-dirs@.
--- Without them around a hundred modules per snapshot fail to resolve
--- @MachDeps.h@ alone, and since the three tools disagree about whether an
--- unresolvable include is fatal, the failure counts end up describing include
--- resolution rather than the preprocessors.
-searchPath :: FilePath -> Prepared -> [FilePath]
-searchPath root p = stubIncludes <> [packageDir </> "include", packageDir, root]
-  where
-    -- Corpus layout is <root>/<package-version>/..., so the package directory
-    -- is the first component below the root.
-    packageDir = case stripPrefixDir root (prepPath p) of
-      Just (component : _) -> root </> component
-      _ -> takeDirectory (prepPath p)
-
 -- | Macros the compiler defines, which no header supplies.
 --
 -- @__GLASGOW_HASKELL__@ is the single most referenced macro in real Haskell —
@@ -512,14 +521,26 @@ searchPath root p = stubIncludes <> [packageDir </> "include", packageDir, root]
 -- an error but silently sends every version test down its oldest branch, so
 -- the corpus preprocesses code that no real build would.
 --
--- The value tracks the compiler the pinned snapshot names (@with-compiler:
--- ghc-9.10.3@ for lts-24.58), in GHC\'s major*100+minor encoding. Bump it with
+-- The version tracks the compiler the pinned snapshot names (@with-compiler:
+-- ghc-9.10.3@ for lts-24.58), in GHC's major*100+minor encoding. Bump it with
 -- the snapshot.
 predefinedMacros :: [(BS.ByteString, BS.ByteString)]
 predefinedMacros =
   [ ("__GLASGOW_HASKELL__", "910"),
     ("__GLASGOW_HASKELL_PATCHLEVEL1__", "3"),
-    ("__GLASGOW_HASKELL_PATCHLEVEL2__", "0")
+    ("__GLASGOW_HASKELL_PATCHLEVEL2__", "0"),
+    -- GHC also defines the host and build platform, in these exact forms
+    -- (confirmed against @ghc -E@). Without them a module that dispatches on
+    -- platform falls through to its @#error@ branch, and the 731 modules that
+    -- test @mingw32_HOST_OS@ take the non-Windows path for the wrong reason.
+    --
+    -- A fixed platform is claimed rather than the host's, so that a number
+    -- measured on one machine is comparable with one measured on another: the
+    -- platform decides which branches exist to be preprocessed at all.
+    ("x86_64_HOST_ARCH", "1"),
+    ("x86_64_BUILD_ARCH", "1"),
+    ("linux_HOST_OS", "1"),
+    ("linux_BUILD_OS", "1")
   ]
 
 -- | Directories holding stand-ins for headers a real build would supply.
@@ -550,6 +571,89 @@ warnMissingStubs = mapM_ check stubIncludes
         if present
           then "stub headers: " <> dir
           else "warning: no stub headers at " <> dir <> " (set AIHC_CPP_BENCH_INCLUDE)"
+
+-- | Where to look for an @#include@ target, beyond the including file's own
+-- directory.
+--
+-- A real build passes include directories that a bare source tree does not
+-- have: the RTS headers GHC ships (stubbed under @bench\/include@) and whatever
+-- the package declares in @include-dirs@, which is where nearly all of the
+-- corpus keeps its own headers. Without them around a hundred modules per
+-- snapshot fail to resolve @MachDeps.h@ alone, and since the three tools
+-- disagree about whether an unresolvable include is fatal, the failure counts
+-- end up describing include resolution rather than the preprocessors.
+searchPathFor :: M.Map FilePath [FilePath] -> FilePath -> FilePath -> [FilePath]
+searchPathFor declared root path =
+  stubIncludes <> declaredDirs <> [packageDir </> "include", packageDir, root]
+  where
+    packageDir = packageDirOf root path
+    declaredDirs = M.findWithDefault [] packageDir declared
+
+-- | The package a corpus file belongs to.
+--
+-- Corpus layout is @\<root\>\/\<package-version\>\/...@, so the package
+-- directory is the first component below the root.
+packageDirOf :: FilePath -> FilePath -> FilePath
+packageDirOf root path = case stripPrefixDir root path of
+  Just (component : _) -> root </> component
+  _ -> takeDirectory path
+
+-- | Read @include-dirs@ out of every package's @.cabal@ file, once.
+--
+-- Packages keep their headers wherever they like — @src@, @cbits@, @srcinc@ —
+-- and tell Cabal about it with @include-dirs@. Guessing @\<package\>\/include@
+-- covers almost none of them: of the include sites that failed to resolve
+-- before this, nine in ten named a header that was present in its own package
+-- but in a directory only the @.cabal@ file knows about.
+--
+-- This is a deliberately loose parser. It takes every @include-dirs@ field in
+-- the file regardless of which stanza or conditional it sits under, because the
+-- benchmark wants a superset: a directory that some other component would have
+-- used costs nothing here, whereas a missing one costs a module.
+packageIncludeDirs :: FilePath -> IO (M.Map FilePath [FilePath])
+packageIncludeDirs root = do
+  packages <- fromRight [] <$> (try (listDirectory root) :: IO (Either SomeException [FilePath]))
+  M.fromList . concat <$> mapM forPackage packages
+  where
+    forPackage name = do
+      let dir = root </> name
+      entries <- fromRight [] <$> (try (listDirectory dir) :: IO (Either SomeException [FilePath]))
+      case filter ((== ".cabal") . takeExtension) entries of
+        [] -> pure []
+        (cabalFile : _) -> do
+          contents <- fromRight BS.empty <$> (try (BS.readFile (dir </> cabalFile)) :: IO (Either SomeException BS.ByteString))
+          pure [(dir, map (dir </>) (parseIncludeDirs contents))]
+
+-- | Pull the values of every @include-dirs@ field out of a @.cabal@ file.
+--
+-- A field's value may sit on its own line, on following lines indented further,
+-- and be separated by commas or whitespace. A following line that looks like
+-- another field ends the list.
+parseIncludeDirs :: BS.ByteString -> [FilePath]
+parseIncludeDirs = go . BS8.lines
+  where
+    go [] = []
+    go (line : rest) = case BS8.break (== ':') (BS8.map toLower line) of
+      (name, remainder)
+        | BS8.strip name == "include-dirs",
+          not (BS.null remainder) ->
+            let indent = BS8.length (BS8.takeWhile isSpace line)
+                (continued, after) = span (isContinuation indent) rest
+             in values (BS.drop 1 (BS8.drop (BS8.length name) line))
+                  <> concatMap values continued
+                  <> go after
+      _ -> go rest
+    isContinuation indent line =
+      not (BS.null (BS8.strip line))
+        && BS8.length (BS8.takeWhile isSpace line) > indent
+        && not (isField line)
+    isField line = case BS8.break (== ':') line of
+      (name, remainder) -> not (BS.null remainder) && BS8.all fieldChar (BS8.strip name)
+    fieldChar c = isAlpha c || c == '-'
+    values =
+      map BS8.unpack
+        . concatMap (filter (not . BS.null) . BS8.splitWith isSpace)
+        . BS8.split ','
 
 stripPrefixDir :: FilePath -> FilePath -> Maybe [FilePath]
 stripPrefixDir root path = go (splitDirectories root) (splitDirectories path)

@@ -65,13 +65,14 @@ modules without crashing.
 The three columns are not interchangeable:
 
 - **errored** — the tool produced output but reported a problem in the source.
-  Only aihc-cpp distinguishes this; the other two throw. Most of the 251 are
-  still unresolvable includes, so this is a difference of policy rather than of
-  capability: cpphs ignores an unresolvable include silently.
-- **crashed** — the tool produced nothing. cpphs's 30 are almost all genuine
-  `#error` directives it is right to stop on. hpp's 393 are mostly missing
-  includes, which it treats as fatal, and that is also why it emits the least
-  output.
+  Only aihc-cpp distinguishes this; the other two throw. The sweep prints a
+  breakdown of these, which is how the include-path and predefined-macro gaps
+  below were found. What is left is 45 unresolvable includes and 23 genuine
+  `#error` directives.
+- **crashed** — the tool produced nothing. cpphs's 29 and hpp's 227 are mostly
+  `#error` directives and unresolvable includes, both of which they treat as
+  fatal where aihc-cpp reports and continues. That is a difference of policy
+  rather than of capability, and it is also why hpp emits the least output.
 
 #### Headers a real build would supply
 
@@ -79,6 +80,14 @@ Every tool searches `bench/include`, the package's own `include` directory (what
 Cabal passes from `include-dirs`), and the package root, as well as the
 including file's own directory. `AIHC_CPP_BENCH_INCLUDE` overrides the first
 with a colon-separated list.
+
+Include directories come from three places: `bench/include`, whatever the
+package declares in `include-dirs` in its `.cabal` file, and the package root.
+The middle one matters most — packages keep headers in `src`, `cbits`, `srcinc`
+and the like, and only the `.cabal` file says where. Before it was parsed, nine
+in ten unresolvable includes named a header that was present in its own package
+but in a directory nothing was looking at; reading the field took aihc-cpp's
+unresolved includes from 228 to 45.
 
 `bench/include` holds stand-ins for headers a real build has and a bare source
 tree does not:
@@ -119,17 +128,24 @@ a header, so no amount of include-path fixing makes it appear. Left undefined it
 is zero in an `#if`, which is not an error but silently sends every version test
 down its oldest branch, so the corpus preprocesses code no real build would.
 
-All three tools are given it, along with the two patchlevel macros, through
-their own predefined-macro APIs (`configMacros`, cpphs's `defines`, hpp's
-`addDefinition`). The value follows the compiler the pinned snapshot names —
-`with-compiler: ghc-9.10.3` for lts-24.58, so `910` in GHC's `major*100+minor`
-encoding — and should be bumped with the snapshot.
+GHC also defines the host and build platform — `x86_64_HOST_ARCH`,
+`linux_HOST_OS` and the `_BUILD_` variants, in exactly those forms. Without them
+a module that dispatches on platform falls through to its `#error` branch, and
+the 731 modules that test `mingw32_HOST_OS` take the non-Windows path for the
+wrong reason.
 
-Defining it took cpphs's crashes from 30 to 18, because `#ifndef
+All three tools are given these through their own predefined-macro APIs
+(`configMacros`, cpphs's `defines`, hpp's `addDefinition`). The compiler version
+follows the pinned snapshot — `with-compiler: ghc-9.10.3` for lts-24.58, so
+`910` in GHC's `major*100+minor` encoding — and should be bumped with it. The
+platform is fixed rather than taken from the host, so that a number measured on
+one machine is comparable with one measured on another: the platform decides
+which branches exist to be preprocessed at all.
+
+Defining these took cpphs's crashes from 30 to 18 — `#ifndef
 __GLASGOW_HASKELL__` guards around `#error This code isn't being built with GHC`
-are now correctly skipped, and aihc-cpp's errors from 251 to 239. All three
-produce more output, which is the point: more of the corpus is code a real build
-would actually compile.
+are now correctly skipped — and all three produce more output, which is the
+point: more of the corpus is code a real build would actually compile.
 
 #### Sampled benchmark
 
