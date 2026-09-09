@@ -51,10 +51,14 @@
         runghc -package-env - -package=aihc-cpp -itest app/cpp-progress/Main.hs --strict
       '';
       haskell-format = sourceCheck "aihc-cpp-haskell-format" [pkgs.ormolu pkgs.findutils] ''
-        find src test app -name '*.hs' -not -path '*/Test/Fixtures/*' -print0 | xargs -0 -r ormolu --mode check
+        find src test app bench -name '*.hs' -not -path '*/Test/Fixtures/*' -not -path '*/.*' -print0 | xargs -0 -r ormolu --mode check
       '';
       haskell-lint = sourceCheck "aihc-cpp-haskell-lint" [pkgs.hlint pkgs.findutils] ''
-        find src test app -name '*.hs' -not -path '*/Test/Fixtures/*' -print0 | xargs -0 -r hlint
+        find src test app bench -name '*.hs' -not -path '*/Test/Fixtures/*' -not -path '*/.*' -print0 | xargs -0 -r hlint -j4
+      '';
+      shell-lint = sourceCheck "aihc-cpp-shell-lint" [pkgs.shellcheck pkgs.shfmt] ''
+        shellcheck bench/*.sh
+        shfmt --diff --indent 2 --case-indent bench/*.sh
       '';
       cabal-format = sourceCheck "aihc-cpp-cabal-format" [pkgs.haskellPackages.cabal-gild] ''
         cabal-gild --mode check --input aihc-cpp.cabal
@@ -73,6 +77,9 @@
           pkgs.ormolu
           pkgs.hlint
           pkgs.haskellPackages.cabal-gild
+          pkgs.shellcheck
+          pkgs.shfmt
+          pkgs.curl
         ];
       };
     });
