@@ -12,6 +12,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   macro invocation produced by an expansion is rescanned and expanded, matching
   GHC's C preprocessor and `cpphs`. The C standard's non-recursive-expansion
   rule is honoured, so a macro is never expanded inside its own expansion.
+- A pragma nested inside a Haskell block comment no longer terminates that
+  comment. `{-#` is treated as a pragma delimiter only outside a comment;
+  inside one it counts as an ordinary nested `{-`, balancing the `-}` of the
+  closing `#-}`. Previously each such pragma decremented the comment depth,
+  making CPP directives in the rest of the commented-out region live —
+  producing spurious `unmatched #endif` warnings and, with a commented-out
+  `#if 0`, silently dropping the comment's contents
+  ([#1](https://github.com/ai-haskell-compiler/aihc-cpp/issues/1)).
 
 ## [1.0.0.3] - 2026-07-26
 

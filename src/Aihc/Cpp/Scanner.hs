@@ -116,9 +116,12 @@ scanLineDepthOnly = goDepth
               | b1 == 0x7B && b2 == 0x2D -> -- '{-'
                   let cur' = advance2 cur
                    in case peekByte cur' of
-                        Just 0x23 ->
-                          -- {-# is a pragma, not a comment
-                          goDepth hsDepth cDepth (advance cur)
+                        Just 0x23
+                          | hsDepth == 0 ->
+                              -- {-# is a pragma, not a comment (only at depth 0;
+                              -- inside a comment it is an ordinary nested opener,
+                              -- balancing the -} of its closing #-})
+                              goDepth hsDepth cDepth (advance cur)
                         _ ->
                           goDepth (hsDepth + 1) cDepth cur'
               | hsDepth == 0 && b1 == 0x2F && b2 == 0x2A -> -- '/*'
@@ -324,25 +327,27 @@ scanLine hsDepth0 cDepth0 cursor0 =
                                                   (curPos cur')
                                                   inCommentAfter
                                                   cur'
-                                          -- === Start of Haskell block comment: {- (but not {-#) ===
+                                          -- === Start of Haskell block comment: {- (but not a top-level {-# pragma) ===
                                           else
                                             if b1 == 0x7B && b2 == 0x2D -- '{-'
                                               then
                                                 let cur' = advance2 cur
                                                  in case peekByte cur' of
-                                                      Just 0x23 ->
-                                                        -- '#' => pragma {-#, not a block comment
-                                                        -- Advance past '{' only, continue in same mode
-                                                        go
-                                                          hsDepth
-                                                          cDepth
-                                                          False
-                                                          False
-                                                          False
-                                                          acc
-                                                          spanStart
-                                                          spanInComment
-                                                          (advance cur)
+                                                      Just 0x23
+                                                        | hsDepth == 0 ->
+                                                            -- '#' => pragma {-#, not a block comment
+                                                            -- (only outside comments; nested {-# opens)
+                                                            -- Advance past '{' only, continue in same mode
+                                                            go
+                                                              hsDepth
+                                                              cDepth
+                                                              False
+                                                              False
+                                                              False
+                                                              acc
+                                                              spanStart
+                                                              spanInComment
+                                                              (advance cur)
                                                       _ ->
                                                         -- Flush any text before {-, emit {- as comment
                                                         let acc' = emit acc spanStart (curPos cur) cur spanInComment
