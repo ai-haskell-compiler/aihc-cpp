@@ -1,2 +1,5 @@
 /dist-newstyle/
 /result
+
+bench/.corpus/
+bench/.corpus-process/

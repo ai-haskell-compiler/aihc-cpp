@@ -23,6 +23,64 @@ Current baseline:
 - `46/46` implemented (`100.00%` complete)
 <!-- AUTO-GENERATED: END cpp-progress -->
 
+## Benchmarking
+
+GHC does not preprocess Haskell itself: it invokes a C preprocessor with a fixed
+set of flags, both of which it reports through `ghc --info` (on a typical Unix
+install, `gcc -E -undef -traditional`). That command is what "against GHC" means
+here, and the harness reads it from `ghc --info` rather than hardcoding it, so it
+always measures against the preprocessor the local GHC would really run.
+
+There are two layers, because they answer different questions.
+
+```bash
+just bench
+```
+
+In-process, aihc-cpp against [cpphs], the other pure-Haskell C preprocessor.
+Both are called as libraries on the same preloaded bytes with results forced to
+normal form, so nothing but preprocessing is timed. This is the layer to watch
+for regressions.
+
+```bash
+just bench-ghc
+```
+
+Process against process, aihc-cpp against GHC's C preprocessor. Requires
+`hyperfine`, which the dev shell provides.
+
+### What makes the comparison fair
+
+A one-shot process spends most of its wall clock not preprocessing, and the two
+sides do not pay the same fixed cost — an RTS is not a compiler driver. Timing
+`aihc-cpp file.hs` against `cpp file.hs` on a 100KB input measures startup, and
+gets the answer backwards: by raw wall clock aihc-cpp looks 1.6x *faster*, while
+the preprocessing itself is several times slower. The harness therefore:
+
+- **Gates on output parity.** Each side's output is normalised — line markers
+  resolved to explicit positions, blank lines and interior whitespace dropped —
+  and diffed before anything is timed. Inputs the two disagree on are reported
+  and excluded, because tools producing different output are not doing the same
+  work. Note this gate is deliberately looser than the correctness oracle in
+  `test/`, which compares exactly; parity here only decides what is comparable.
+- **Excludes known-divergent inputs by design.** aihc-cpp is Haskell-aware and
+  will not expand macros inside Haskell block comments or string literals, which
+  GHC's C preprocessor happily does. That case is benchmarked in-process only,
+  and reported rather than hidden.
+- **Runs both sides the same way.** A fresh process reading a file and writing
+  to stdout. Neither side gets credit for being a library.
+- **Subtracts each side's own startup.** Measured by copying a file through
+  untouched (aihc-cpp) and preprocessing an empty file (GHC's preprocessor).
+- **Scales the corpus up** (`AIHC_CPP_BENCH_SCALE`, default 10x) so the work
+  being measured survives that subtraction, and flags rows where it did not.
+
+The corpus is generated, deterministic, and weighted towards the case that
+dominates real modules: thousands of lines the preprocessor merely copies, with
+a few directives at the top. Set `AIHC_CPP_BENCH_CORPUS` to point either layer
+at a directory of real-world modules instead.
+
+[cpphs]: https://hackage.haskell.org/package/cpphs
+
 ## Commands
 
 Run all cpp tests:
