@@ -1,4 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveAnyClass #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | Raw throughput of aihc-cpp against the other two pure-Haskell C
@@ -28,15 +30,17 @@ module Main (main) where
 
 import Aihc.Cpp
   ( Config (..),
+    Diagnostic (..),
     IncludeRequest (..),
     Result (..),
+    Severity (..),
     Step (..),
     defaultConfig,
     preprocess,
   )
 import Bench.Corpus (CorpusCase (..), corpusCases, defaultCorpusRoot, generateCorpus)
-import Control.DeepSeq (force)
-import Control.Exception (SomeException, evaluate, try)
+import Control.DeepSeq (NFData, force)
+import Control.Exception (AsyncException, SomeException, evaluate, fromException, throwIO, try)
 import Control.Monad (foldM)
 import Control.Monad.Trans.Except (runExceptT)
 import qualified Data.ByteString as BS
@@ -44,7 +48,8 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.Either (fromRight, rights)
 import Data.List (isPrefixOf, isSuffixOf, sort)
 import Data.Maybe (fromMaybe)
-import qualified Data.Text as T
+import GHC.Clock (getMonotonicTime)
+import GHC.Generics (Generic)
 import qualified Hpp
 import qualified Hpp.Config as HppConfig
 import Language.Preprocessor.Cpphs
@@ -90,28 +95,32 @@ byteBudget = maybe defaultBudget read <$> lookupEnv "AIHC_CPP_BENCH_MAX_BYTES"
   where
     defaultBudget = 8 * 1024 * 1024
 
--- | Every @.hs@ file under a directory.
+-- | Every @.hs@ file under a directory, as packed paths.
 --
--- Iterative rather than recursive, with the accumulator forced as it goes: a
--- monorepo can hold hundreds of thousands of entries, and building that tree
--- with @mapM@ and @concat@ retains every intermediate listing at once.
-listHsFiles :: FilePath -> IO [FilePath]
-listHsFiles root = sort <$> go [root] []
+-- Iterative rather than recursive, with the accumulator forced as it goes, and
+-- paths held as 'BS.ByteString' rather than 'FilePath'. Both matter at snapshot
+-- scale: a full Stackage checkout is fifty thousand modules under a tree of
+-- several hundred thousand entries, and a Haskell 'String' path costs around
+-- two kilobytes, so keeping them unpacked exhausted the heap before the walk
+-- finished.
+listHsFiles :: FilePath -> IO [BS.ByteString]
+listHsFiles root = sort <$> go [BS8.pack root] []
   where
     go [] acc = pure acc
     go (dir : queue) acc = do
-      entries <- fromRight [] <$> tryIO (listDirectory dir)
-      (dirs, files) <- foldM (classify dir) ([], []) entries
-      go (dirs <> queue) $! foldl' (flip (:)) acc files
-    classify dir (dirs, files) entry
+      let dirPath = BS8.unpack dir
+      entries <- fromRight [] <$> tryIO (listDirectory dirPath)
+      (dirs, files) <- foldM (classify dirPath) ([], []) entries
+      go (dirs <> queue) $! foldl (flip (:)) acc files
+    classify dirPath (dirs, files) entry
       | "." `isPrefixOf` entry = pure (dirs, files)
       | otherwise = do
-          let path = dir </> entry
+          let path = dirPath </> entry
           isDir <- doesDirectoryExist path
           pure $
             if isDir
-              then (path : dirs, files)
-              else (dirs, if ".hs" `isSuffixOf` entry then path : files else files)
+              then (BS8.pack path : dirs, files)
+              else (dirs, if ".hs" `isSuffixOf` entry then BS8.pack path : files else files)
     tryIO :: IO a -> IO (Either SomeException a)
     tryIO = try
 
@@ -121,7 +130,7 @@ listHsFiles root = sort <$> go [root] []
 -- than from the front, so the sample spans the whole tree instead of stopping
 -- inside whichever package sorts first, and only the candidates are read.
 -- Deterministic, so two runs measure the same modules.
-selectModules :: Int -> [FilePath] -> IO [FilePath]
+selectModules :: Int -> [BS.ByteString] -> IO [FilePath]
 selectModules budget paths = take' budget (every stride paths)
   where
     -- Bound how many files are opened just to find out whether they use CPP,
@@ -133,9 +142,10 @@ selectModules budget paths = take' budget (every stride paths)
       [] -> []
       (x : rest) -> x : every n (drop (n - 1) rest)
     take' _ [] = pure []
-    take' remaining (path : rest)
+    take' remaining (packed : rest)
       | remaining <= 0 = pure []
       | otherwise = do
+          let path = BS8.unpack packed
           bytes <- fromRight BS.empty <$> (try (BS.readFile path) :: IO (Either SomeException BS.ByteString))
           if usesCpp bytes
             then (path :) <$> take' (remaining - BS.length bytes) rest
@@ -156,16 +166,29 @@ usesCpp = any isDirective . BS8.lines
     directives =
       ["if", "ifdef", "ifndef", "elif", "else", "endif", "define", "undef", "include"]
 
--- | An input, read from disk once.
+-- | An input, identified by path.
 --
--- Only the bytes are held. The two other input shapes the tools want are built
--- inside the timed region, per iteration, and discarded — see 'tools'.
-data Prepared = Prepared
-  { prepPath :: !FilePath,
-    prepBytes :: !BS.ByteString
+-- Nothing is preloaded. Each tool reads the file inside the timed region and
+-- discards it, so peak memory is one module rather than the whole corpus and
+-- there is no ceiling on how much of a snapshot can be measured. The read is
+-- charged to every tool equally and quantified by the @(read only)@ row.
+newtype Prepared = Prepared {prepPath :: FilePath}
+
+-- | What one tool did with one module.
+data Outcome = Outcome
+  { -- | Bytes of output produced.
+    outBytes :: !Int,
+    -- | The tool produced output but reported an error in the source.
+    outErrored :: !Bool
   }
+  deriving (Generic, NFData)
 
 -- | The three preprocessors behind one interface, plus the cost of feeding one.
+--
+-- The two parenthesised entries are not competitors. @(read only)@ is the file
+-- read every tool pays for; @(read + String)@ adds the 'String' conversion that
+-- cpphs\'s API demands. Subtract the matching baseline from a tool to compare
+-- preprocessing rather than plumbing.
 --
 -- Each forces its output completely and returns the length, so that no tool
 -- benefits from leaving a lazy structure unevaluated and all three are charged
@@ -181,25 +204,38 @@ data Prepared = Prepared
 -- That does charge cpphs for marshalling that is not preprocessing, so the cost
 -- is measured too: the @(input marshalling)@ entry does the 'String' conversion
 -- and nothing else. Subtract it from cpphs to recover a like-for-like number.
-tools :: [(String, FilePath -> Prepared -> IO Int)]
+tools :: [(String, FilePath -> Prepared -> IO Outcome)]
 tools =
   [ ( "aihc-cpp",
       \_ p -> do
-        out <- resultOutput <$> runAihc (prepPath p) (prepBytes p)
-        T.length <$> evaluate (force out)
+        source <- BS.readFile (prepPath p)
+        result <- runAihc (prepPath p) source
+        -- aihc-cpp reports a bad directive or an unresolvable include as a
+        -- diagnostic and still returns output; hpp and cpphs throw. Reporting
+        -- these separately from crashes keeps that difference visible instead
+        -- of turning it into a robustness claim in either direction.
+        let errored = any ((== Error) . diagSeverity) (resultDiagnostics result)
+        flip Outcome errored . BS.length <$> evaluate (force (resultOutput result))
     ),
     ( "hpp",
       \root p -> do
-        out <- hpp root p (BS8.lines (prepBytes p))
-        sum . map BS.length <$> evaluate (force out)
+        source <- BS.readFile (prepPath p)
+        out <- hpp root p (BS8.lines source)
+        flip Outcome False . sum . map BS.length <$> evaluate (force out)
     ),
     ( "cpphs",
       \root p -> do
-        out <- runCpphs (cpphsOptions root) (prepPath p) (BS8.unpack (prepBytes p))
-        length <$> evaluate (force out)
+        source <- BS.readFile (prepPath p)
+        out <- runCpphs (cpphsOptions root) (prepPath p) (BS8.unpack source)
+        flip Outcome False . length <$> evaluate (force out)
     ),
-    ( "(input marshalling)",
-      \_ p -> length <$> evaluate (force (BS8.unpack (prepBytes p)))
+    ( "(read only)",
+      \_ p -> flip Outcome False . BS.length <$> BS.readFile (prepPath p)
+    ),
+    ( "(read + String)",
+      \_ p -> do
+        source <- BS.readFile (prepPath p)
+        flip Outcome False . length <$> evaluate (force (BS8.unpack source))
     )
   ]
 
@@ -218,10 +254,110 @@ main = do
         ]
     RealWorld root -> do
       found <- listHsFiles root
-      budget <- byteBudget
-      prepared <- mapM prepare =<< selectModules budget found
-      reportCorpus root (length found) prepared
-      defaultMain [bgroup "real-world" (map (sweep root prepared) tools)]
+      full <- lookupEnv "AIHC_CPP_BENCH_SWEEP"
+      selected <- lookupEnv "AIHC_CPP_BENCH_TOOLS"
+      let chosen = case selected of
+            Nothing -> tools
+            Just names -> [t | t@(name, _) <- tools, name `elem` splitOn ',' names]
+      case full of
+        Just _ -> fullSweep root chosen =<< mapM prepare =<< allCppModules found
+        Nothing -> do
+          budget <- byteBudget
+          prepared <- mapM prepare =<< selectModules budget found
+          reportCorpus root (length found) prepared
+          defaultMain [bgroup "real-world" (map (sweep root prepared) chosen)]
+
+splitOn :: Char -> String -> [String]
+splitOn sep str = case break (== sep) str of
+  (chunk, []) -> [chunk]
+  (chunk, _ : rest) -> chunk : splitOn sep rest
+
+-- | Preprocess every CPP-using module in the corpus, once, per tool.
+--
+-- The sampled benchmark above exists to catch regressions and needs repeated
+-- runs for its statistics, which puts a practical ceiling on corpus size. This
+-- answers a different question — how does each tool fare across a whole
+-- snapshot — and so takes one pass over everything and reports wall clock and
+-- throughput rather than a distribution.
+fullSweep :: FilePath -> [(String, FilePath -> Prepared -> IO Outcome)] -> [Prepared] -> IO ()
+fullSweep root chosen prepared = do
+  corpusBytes <- sum <$> mapM (fmap BS.length . BS.readFile . prepPath) prepared
+  putStrLn
+    ( "full sweep: "
+        <> show (length prepared)
+        <> " CPP-using modules, "
+        <> show (corpusBytes `div` (1024 * 1024))
+        <> " MiB"
+    )
+  putStrLn ""
+  putStrLn
+    ( pad 18 "tool"
+        <> pad 9 "ok"
+        <> pad 9 "errored"
+        <> pad 9 "crashed"
+        <> pad 11 "seconds"
+        <> pad 11 "MiB out"
+        <> "MiB/s"
+    )
+  putStrLn (replicate 74 '-')
+  mapM_ (one corpusBytes) chosen
+  where
+    one corpusBytes (name, run) = do
+      start <- getMonotonicTime
+      -- Folded strictly, keeping only counters and the first few failures.
+      -- Retaining every outcome kept each failure\'s exception alive, and with
+      -- it whatever the exception\'s message had captured.
+      tally <- foldM (step run) (Tally 0 0 0 0 []) prepared
+      elapsed <- subtract start <$> getMonotonicTime
+      let mib = fromIntegral corpusBytes / 1048576 :: Double
+      putStrLn
+        ( pad 18 name
+            <> pad 9 (show (tallyOk tally))
+            <> pad 9 (show (tallyErrored tally))
+            <> pad 9 (show (tallyCrashed tally))
+            <> pad 11 (showFixed 2 elapsed)
+            <> pad 11 (showFixed 1 (fromIntegral (tallyBytes tally) / 1048576 :: Double))
+            <> showFixed 1 (mib / elapsed)
+        )
+      mapM_ (\msg -> putStrLn ("    " <> msg)) (reverse (tallyFailures tally))
+    step run tally p = do
+      outcome <- tryTool (run root p)
+      pure $! case outcome of
+        Right o
+          | outErrored o -> tally {tallyErrored = tallyErrored tally + 1, tallyBytes = tallyBytes tally + outBytes o}
+          | otherwise -> tally {tallyOk = tallyOk tally + 1, tallyBytes = tallyBytes tally + outBytes o}
+        Left err ->
+          tally
+            { tallyCrashed = tallyCrashed tally + 1,
+              tallyFailures = keepFew (prepPath p <> ": " <> show err) (tallyFailures tally)
+            }
+    keepFew msg msgs
+      | length msgs >= 3 = msgs
+      | otherwise = length msg `seq` (msg : msgs)
+    pad n str = str <> replicate (max 1 (n - length str)) ' '
+    showFixed places x =
+      let scaled = round (x * 10 ^ places) :: Integer
+          (whole, frac) = scaled `divMod` (10 ^ places)
+       in show whole <> "." <> pad0 places (show frac)
+    pad0 n str = replicate (n - length str) '0' <> str
+
+-- | Running counts for one tool\'s pass over the corpus.
+data Tally = Tally
+  { tallyOk :: !Int,
+    tallyErrored :: !Int,
+    tallyCrashed :: !Int,
+    tallyBytes :: !Int,
+    tallyFailures :: [String]
+  }
+
+-- | Every CPP-using module, with no sampling and no budget.
+allCppModules :: [BS.ByteString] -> IO [FilePath]
+allCppModules = fmap reverse . foldM check []
+  where
+    check acc packed = do
+      let path = BS8.unpack packed
+      bytes <- fromRight BS.empty <$> (try (BS.readFile path) :: IO (Either SomeException BS.ByteString))
+      pure $! if usesCpp bytes then path : acc else acc
 
 -- | Preprocess every module in the corpus, as one benchmark.
 --
@@ -229,27 +365,42 @@ main = do
 -- individually, and there are far too many to list separately. Timing the whole
 -- set at once is also the workload that matters — what a build pays across a
 -- project, not what one module costs.
-sweep :: FilePath -> [Prepared] -> (String, FilePath -> Prepared -> IO Int) -> Benchmark
+sweep :: FilePath -> [Prepared] -> (String, FilePath -> Prepared -> IO Outcome) -> Benchmark
 sweep root prepared (name, run) =
   bench name (nfIO (foldM step 0 prepared))
   where
     step !acc p = (acc +) <$> safely (run root p)
 
--- | Run a preprocessor, treating failure as zero output.
+-- | Run a preprocessor, treating a failure of its own as zero output.
 --
 -- Real modules routinely reference headers that are not present and macros that
 -- are never defined, and the three tools disagree about which of those is
 -- fatal. A crash must not abort the sweep, but it does mean less work was done,
--- which is why 'reportCorpus' prints the failure counts alongside the timings.
-safely :: IO Int -> IO Int
-safely act = fromRight 0 <$> (try act :: IO (Either SomeException Int))
+-- which is why the failure counts are reported alongside the timings.
+safely :: IO Outcome -> IO Int
+safely act = either (const 0) outBytes <$> tryTool act
+
+-- | Catch what a preprocessor does wrong, not what the runtime does.
+--
+-- A plain @try \@SomeException@ also catches heap and stack overflow, which
+-- turned a benchmark run that was simply given too little memory into a report
+-- of hundreds of \"tool failures\" — and the tool that tripped the limit looked
+-- slow rather than starved. Runtime exhaustion is a problem with how the
+-- benchmark was run, so it is re-thrown and aborts the run loudly.
+tryTool :: IO a -> IO (Either SomeException a)
+tryTool act = do
+  outcome <- try act
+  case outcome of
+    Left err | Just async <- fromException err -> throwIO (async :: AsyncException)
+    _ -> pure outcome
 
 prepare :: FilePath -> IO Prepared
-prepare path = Prepared path <$> BS.readFile path
+prepare = pure . Prepared
 
 -- | Describe the discovered corpus, and how much of it each tool can handle.
 reportCorpus :: FilePath -> Int -> [Prepared] -> IO ()
 reportCorpus root found prepared = do
+  corpusBytes <- sum <$> mapM (fmap BS.length . BS.readFile . prepPath) prepared
   putStrLn
     ( "real-world corpus: "
         <> show (length prepared)
@@ -258,15 +409,15 @@ reportCorpus root found prepared = do
         <> " sampled CPP-using modules from "
         <> root
         <> ", "
-        <> show (sum (map (BS.length . prepBytes) prepared) `div` 1024)
+        <> show (corpusBytes `div` 1024)
         <> " KiB (raise AIHC_CPP_BENCH_MAX_BYTES to widen)"
     )
   mapM_ report tools
   where
     report (name, run) = do
-      outcomes <- mapM (\p -> (,) (prepPath p) <$> (try (run root p) :: IO (Either SomeException Int))) prepared
+      outcomes <- mapM (\p -> (,) (prepPath p) <$> tryTool (run root p)) prepared
       let failed = [(path, show err) | (path, Left err) <- outcomes]
-          produced = sum (rights (map snd outcomes))
+          produced = sum (map outBytes (rights (map snd outcomes)))
       putStrLn
         ( "  "
             <> name
@@ -289,11 +440,12 @@ reportCorpus root found prepared = do
 -- for a win when it is really a tool that gave up early or emitted far less.
 reportOne :: FilePath -> (CorpusCase, Prepared) -> IO ()
 reportOne root (c, p) = do
+  inBytes <- BS.length <$> BS.readFile (prepPath p)
   sizes <- mapM (\(name, run) -> (,) name <$> safely (run root p)) tools
   putStrLn
     ( caseName c
         <> ": in "
-        <> show (BS.length (prepBytes p))
+        <> show inBytes
         <> "B, out"
         <> concat [" " <> name <> " " <> show n | (name, n) <- sizes]
     )
