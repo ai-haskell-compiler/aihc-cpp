@@ -149,7 +149,8 @@ point: more of the corpus is code a real build would actually compile.
 
 Results are tracked in [`bench/RESULTS.md`](bench/RESULTS.md), regenerated
 weekly by `.github/workflows/benchmark.yml`, which opens a pull request with the
-new table. Review the counts rather than the clock: `ok`, `errored`, `crashed`
+new table. It skips the sweep when nothing has landed on the default branch
+since that file was last written. Review the counts rather than the clock: `ok`, `errored`, `crashed`
 and `MiB out` are deterministic, while a single pass on a shared CI runner moves
 by 10% or more between runs.
 

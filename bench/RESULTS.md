@@ -4,6 +4,11 @@ Every CPP-using module in a pinned Stackage snapshot, preprocessed once by each
 tool. Regenerated weekly by `.github/workflows/benchmark.yml`, which opens a
 pull request with the new table.
 
+The workflow skips the sweep entirely when nothing has landed on the default
+branch since this file was last written — the results cannot have changed, and
+the corpus is a gigabyte of downloads. A manual run from the Actions tab goes
+ahead regardless.
+
 **Read the counts, not the clock.** `ok`, `errored`, `crashed` and `MiB out` are
 deterministic: a change in them means a change in behaviour, and is worth
 looking into. The timings come from a single pass on a shared CI runner and
