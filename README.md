@@ -34,30 +34,44 @@ Hackage, [hpp] and [cpphs]. All three run in-process as libraries, on the same
 preloaded bytes, with output forced, so the only thing timed is preprocessing —
 no process startup, no reading the entry file, no lazy IO left unevaluated.
 
-### Real-world corpus
+### Stackage corpus
 
-Point the benchmark at a directory of Haskell source and it will sample the
-CPP-using modules under it:
+The meaningful numbers come from real code. `just bench-stackage` fetches
+package sources from a pinned Stackage snapshot (`lts-24.58`, GHC 9.10.3) and
+benchmarks the CPP-using modules in them:
+
+```bash
+just bench-stackage
+```
+
+The first run downloads and extracts into `dist-newstyle/`; later runs reuse it.
+By default it takes a stride of 400 packages through the snapshot's 3,441, which
+spans the list while keeping the download to a few hundred megabytes. Set
+`AIHC_CPP_STACKAGE_PACKAGES=0` for the whole snapshot.
+
+Over 434 CPP-using modules (4.1 MB) from 426 Stackage packages, on an M-series
+Mac with GHC 9.12.4:
+
+| | time | modules preprocessed | output |
+| --- | --- | --- | --- |
+| aihc-cpp | 165 ms | 434 / 434 | 3810 KiB |
+| cpphs | 300 ms | 429 / 434 | 3808 KiB |
+| hpp | 1.89 s | 366 / 434 | 3103 KiB |
+
+Read the failure column alongside the times. Real modules reference headers that
+are absent and macros that are never defined, the three tools disagree about
+which of those is fatal, and a tool that gives up early does less work — hpp is
+slowest while producing about four fifths of the output. Widening the sample to
+640 modules does not change the ranking (aihc-cpp 277 ms, cpphs 481 ms, hpp
+3.22 s).
+
+Any directory of Haskell source works, not just the Stackage cache:
 
 ```bash
 AIHC_CPP_BENCH_CORPUS=/path/to/checkout just bench
 ```
 
-Over 178 modules (2.2 MB) sampled from 211 Hackage packages, on an M-series Mac
-with GHC 9.12.4:
-
-| | time | modules preprocessed | output |
-| --- | --- | --- | --- |
-| aihc-cpp | 87.8 ms | 178 / 178 | 2104 KiB |
-| cpphs | 136 ms | 175 / 178 | 2107 KiB |
-| hpp | 664 ms | 151 / 178 | 1149 KiB |
-
-Read the failure column alongside the times: real modules reference headers that
-are absent and macros that are never defined, the three tools disagree about
-which of those is fatal, and a tool that gives up early does less work. hpp is
-slowest despite producing a little over half the output.
-
-The sample is bounded by `AIHC_CPP_BENCH_MAX_BYTES` (2 MB by default), because
+The sample is bounded by `AIHC_CPP_BENCH_MAX_BYTES` (4 MB by default), because
 the corpus is held in memory three times over and a Haskell `String` costs
 upwards of sixteen bytes per character. Modules are taken at an even stride
 through the sorted file list, so the sample spans the tree rather than stopping
@@ -88,7 +102,7 @@ one or two headers.
 So `passthrough` and `conditionals` resemble real code, while `macros` (a
 function-like macro expanded on every line) and `includes` (24 included files)
 are far heavier than anything real. They isolate a cost usefully and mislead if
-read as a workload. Use the real-world corpus for throughput claims.
+read as a workload. Use the Stackage corpus for throughput claims.
 
 ### What is not measured
 

@@ -80,13 +80,14 @@ selectCorpus = maybe (Generated defaultCorpusRoot) RealWorld <$> lookupEnv "AIHC
 -- The corpus is held in memory three times over, once in each preprocessor's
 -- input type, and a Haskell 'String' costs upwards of sixteen bytes per
 -- character — so a few megabytes of source becomes a few hundred megabytes of
--- residency. The default keeps peak memory to roughly a quarter of the heap cap
--- this binary is built with; raise it with @AIHC_CPP_BENCH_MAX_BYTES@ if there
--- is memory to spare, and expect residency to grow with it.
+-- residency. The default samples a few hundred modules and peaks around 435MB,
+-- against the 512MB heap cap this binary carries. Raise it with
+-- @AIHC_CPP_BENCH_MAX_BYTES@ for wider coverage — 8MB has been measured at
+-- roughly the same residency — and lower it if the cap is ever hit.
 byteBudget :: IO Int
 byteBudget = maybe defaultBudget read <$> lookupEnv "AIHC_CPP_BENCH_MAX_BYTES"
   where
-    defaultBudget = 2 * 1024 * 1024
+    defaultBudget = 4 * 1024 * 1024
 
 -- | Every @.hs@ file under a directory.
 --
@@ -122,8 +123,11 @@ listHsFiles root = sort <$> go [root] []
 selectModules :: Int -> [FilePath] -> IO [FilePath]
 selectModules budget paths = take' budget (every stride paths)
   where
-    -- Bound how many files are opened just to find out whether they use CPP.
-    stride = max 1 (length paths `div` 4000)
+    -- Bound how many files are opened just to find out whether they use CPP,
+    -- while still examining enough of them to fill the budget: roughly one
+    -- module in ten uses CPP, and the median one is a few kilobytes.
+    candidates = max 4000 (budget `div` 256)
+    stride = max 1 (length paths `div` candidates)
     every n xs = case xs of
       [] -> []
       (x : rest) -> x : every n (drop (n - 1) rest)
