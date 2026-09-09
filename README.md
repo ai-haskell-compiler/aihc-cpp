@@ -51,25 +51,25 @@ modules, 71 MiB of source. On an M-series Mac with GHC 9.12.4:
 
 | tool | ok | errored | crashed | seconds | MiB out | MiB/s |
 | --- | --- | --- | --- | --- | --- | --- |
-| aihc-cpp | 5534 | 268 | **0** | 3.42 | 69.8 | 21.0 |
-| cpphs | 5772 | 0 | 30 | 4.35 | 69.4 | 16.5 |
-| hpp | 5393 | 0 | 409 | 33.93 | 60.4 | 2.1 |
-| *(read only)* | 5802 | — | — | *0.14* | — | — |
-| *(read + String)* | 5802 | — | — | *0.70* | — | — |
+| aihc-cpp | 5551 | 251 | **0** | 3.26 | 70.0 | 22.0 |
+| cpphs | 5772 | 0 | 30 | 4.25 | 69.6 | 16.9 |
+| hpp | 5409 | 0 | 393 | 34.54 | 60.6 | 2.1 |
+| *(read only)* | 5802 | — | — | *0.15* | — | — |
+| *(read + String)* | 5802 | — | — | *0.68* | — | — |
 
-Subtract each tool's input baseline for a like-for-like figure: aihc-cpp 3.28 s
-against cpphs 3.65 s, so **aihc-cpp is about 1.1x faster**, and hpp is an order
+Subtract each tool's input baseline for a like-for-like figure: aihc-cpp 3.11 s
+against cpphs 3.57 s, so **aihc-cpp is about 1.15x faster**, and hpp is an order
 of magnitude behind both. aihc-cpp is the only one that gets through all 5,802
 modules without crashing.
 
 The three columns are not interchangeable:
 
 - **errored** — the tool produced output but reported a problem in the source.
-  Only aihc-cpp distinguishes this; the other two throw. Most of the 268 are
+  Only aihc-cpp distinguishes this; the other two throw. Most of the 251 are
   still unresolvable includes, so this is a difference of policy rather than of
   capability: cpphs ignores an unresolvable include silently.
 - **crashed** — the tool produced nothing. cpphs's 30 are almost all genuine
-  `#error` directives it is right to stop on. hpp's 409 are mostly missing
+  `#error` directives it is right to stop on. hpp's 393 are mostly missing
   includes, which it treats as fatal, and that is also why it emits the least
   output.
 
@@ -79,17 +79,46 @@ Every tool searches `bench/include`, the package's own `include` directory (what
 Cabal passes from `include-dirs`), and the package root, as well as the
 including file's own directory.
 
-`bench/include` holds stand-ins for headers GHC supplies from the RTS that a
-bare source tree does not have. `MachDeps.h` is much the most common — about a
-hundred modules per snapshot include it — so it is stubbed there, written from
-the macro names GHC's header defines rather than copied from it, with
-conventional 64-bit values. Nothing is compiled, only preprocessed, so the
-values only need to make arithmetic in `#if` conditions evaluate. Supplying it
-took aihc-cpp's error count from 443 to 268 and hpp's crashes from 569 to 409.
+`bench/include` holds stand-ins for headers GHC supplies that a bare source tree
+does not have: `MachDeps.h`, which about a hundred modules per snapshot include,
+and `HsBaseConfig.h`. Both are written from the macro names the real headers
+define rather than copied from them, so the repository stays under one licence,
+with conventional 64-bit values — nothing is compiled, only preprocessed, so the
+values need only make `#if` arithmetic evaluate and expand to something shaped
+like a type name.
 
-The remaining unresolved includes are mostly `cabal_macros.h` (generated
-per-package by Cabal, so a stub would be wrong rather than merely inexact) and
-package-local headers kept in directories Cabal is told about individually.
+`bench/fetch-stackage.sh` additionally generates a `cabal_macros.h` covering
+every package in the snapshot, with `VERSION_`, `MIN_VERSION_` and
+`MIN_TOOL_VERSION_` for each, plus the boot packages taken from the local
+`ghc-pkg`. It goes in the snapshot cache rather than the repository, and
+`AIHC_CPP_BENCH_INCLUDE` takes a colon-separated list so both directories are
+searched.
+
+Together these took aihc-cpp's error count from 443 to 251 and hpp's crashes
+from 569 to 393.
+
+#### Why the macros are not pre-included
+
+A real build does not wait to be asked for `cabal_macros.h`: Cabal passes it
+with `-optP-include`, so the macros are defined for every module. Reproducing
+that is supported — `AIHC_CPP_BENCH_PRELUDE` names a file prepended to every
+module — but it is off by default, because measuring it showed the cost is not
+worth it:
+
+| | seconds | MiB out | errored |
+| --- | --- | --- | --- |
+| include path only | 3.26 | 70.0 | 251 |
+| 212 KB prelude prepended | 69.56 | 756.0 | 249 |
+
+A prelude covering just the 256 packages the corpus actually names is still 212
+KB against an average module of 12 KB, so prepending it turns a 71 MiB corpus
+into 1.3 GiB and the benchmark measures macro-file parsing instead of
+preprocessing — for two fewer errors. A real per-package `cabal_macros.h` is
+small because it holds only that package's own dependencies; a snapshot-wide one
+cannot be.
+
+The remaining unresolved includes are package-local headers kept in directories
+Cabal is told about individually, and generated files like `ghclib_api.h`.
 
 #### Sampled benchmark
 

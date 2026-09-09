@@ -19,13 +19,13 @@ bench:
 # them.
 bench-stackage:
   ./bench/fetch-stackage.sh
-  AIHC_CPP_BENCH_CORPUS=dist-newstyle/stackage/lts-24.58/src cabal bench micro
+  AIHC_CPP_BENCH_CORPUS=dist-newstyle/stackage/lts-24.58/src AIHC_CPP_BENCH_INCLUDE=bench/include:dist-newstyle/stackage/lts-24.58/include cabal bench micro
 
 # One pass over every CPP-using module in the whole snapshot, reporting
 # throughput and what each tool could not handle. Fetches all 3441 packages.
 bench-stackage-sweep:
   AIHC_CPP_STACKAGE_PACKAGES=0 ./bench/fetch-stackage.sh
-  AIHC_CPP_BENCH_CORPUS=dist-newstyle/stackage/lts-24.58/src AIHC_CPP_BENCH_SWEEP=1 cabal bench micro
+  AIHC_CPP_BENCH_CORPUS=dist-newstyle/stackage/lts-24.58/src AIHC_CPP_BENCH_INCLUDE=bench/include:dist-newstyle/stackage/lts-24.58/include AIHC_CPP_BENCH_SWEEP=1 cabal bench micro
 
 fmt:
   nix develop --quiet --command bash -c 'cabal-gild --mode format --io aihc-cpp.cabal; ormolu --mode inplace $(find src test app bench -name "*.hs" -not -path "*/Test/Fixtures/*" -not -path "*/.*")'

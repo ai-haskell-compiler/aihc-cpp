@@ -167,6 +167,28 @@ usesCpp = any isDirective . BS8.lines
     directives =
       ["if", "ifdef", "ifndef", "elif", "else", "endif", "define", "undef", "include"]
 
+-- | Macro definitions prepended to every module, or empty.
+--
+-- A real build does not wait for a module to include cabal_macros.h: Cabal
+-- passes it with @-optP-include@, so MIN_VERSION_ macros are defined for every
+-- module whether or not it mentions the file. Most of the corpus uses them that
+-- way, which is why putting the generated header on the include path alone
+-- barely moved the numbers.
+--
+-- Prepending is not free, though, and it is charged to all three tools equally:
+-- see the @(read only)@ row and the note in the README about how large a
+-- prelude the snapshot-wide file makes.
+{-# NOINLINE preludeBytes #-}
+preludeBytes :: BS.ByteString
+preludeBytes =
+  unsafePerformIO $ do
+    configured <- lookupEnv "AIHC_CPP_BENCH_PRELUDE"
+    case configured of
+      Nothing -> pure BS.empty
+      Just file -> do
+        exists <- doesFileExist file
+        if exists then (<> "\n") <$> BS.readFile file else pure BS.empty
+
 -- | An input, identified by path.
 --
 -- Nothing is preloaded. Each tool reads the file inside the timed region and
@@ -199,7 +221,7 @@ tools :: [(String, FilePath -> Prepared -> IO Outcome)]
 tools =
   [ ( "aihc-cpp",
       \root p -> do
-        source <- BS.readFile (prepPath p)
+        source <- withPrelude <$> BS.readFile (prepPath p)
         result <- runAihc (searchPath root p) (prepPath p) source
         -- aihc-cpp reports a bad directive or an unresolvable include as a
         -- diagnostic and still returns output; hpp and cpphs throw. Reporting
@@ -210,22 +232,22 @@ tools =
     ),
     ( "hpp",
       \root p -> do
-        source <- BS.readFile (prepPath p)
+        source <- withPrelude <$> BS.readFile (prepPath p)
         out <- hpp (searchPath root p) p (BS8.lines source)
         flip Outcome False . sum . map BS.length <$> evaluate (force out)
     ),
     ( "cpphs",
       \root p -> do
-        source <- BS.readFile (prepPath p)
+        source <- withPrelude <$> BS.readFile (prepPath p)
         out <- runCpphs (cpphsOptions (searchPath root p)) (prepPath p) (BS8.unpack source)
         flip Outcome False . length <$> evaluate (force out)
     ),
     ( "(read only)",
-      \_ p -> flip Outcome False . BS.length <$> BS.readFile (prepPath p)
+      \_ p -> flip Outcome False . BS.length . withPrelude <$> BS.readFile (prepPath p)
     ),
     ( "(read + String)",
       \_ p -> do
-        source <- BS.readFile (prepPath p)
+        source <- withPrelude <$> BS.readFile (prepPath p)
         flip Outcome False . length <$> evaluate (force (BS8.unpack source))
     )
   ]
@@ -389,6 +411,12 @@ tryTool act = do
 prepare :: FilePath -> IO Prepared
 prepare = pure . Prepared
 
+-- | Prepend the macro prelude, if one was configured.
+withPrelude :: BS.ByteString -> BS.ByteString
+withPrelude source
+  | BS.null preludeBytes = source
+  | otherwise = preludeBytes <> source
+
 -- | Describe the discovered corpus, and how much of it each tool can handle.
 reportCorpus :: FilePath -> Int -> [Prepared] -> IO ()
 reportCorpus root found prepared = do
@@ -486,7 +514,7 @@ cpphsOptions dirs =
 -- unresolvable include is fatal, the failure counts end up describing include
 -- resolution rather than the preprocessors.
 searchPath :: FilePath -> Prepared -> [FilePath]
-searchPath root p = [stubIncludes, packageDir </> "include", packageDir, root]
+searchPath root p = stubIncludes <> [packageDir </> "include", packageDir, root]
   where
     -- Corpus layout is <root>/<package-version>/..., so the package directory
     -- is the first component below the root.
@@ -494,32 +522,40 @@ searchPath root p = [stubIncludes, packageDir </> "include", packageDir, root]
       Just (component : _) -> root </> component
       _ -> takeDirectory (prepPath p)
 
--- | Directory holding stand-ins for headers a real build would supply.
+-- | Directories holding stand-ins for headers a real build would supply.
 --
--- Relative to the package root, which is where @cabal bench@ runs. Overridable
--- so the binary can be run from elsewhere; 'warnMissingStubs' says so if it is
--- not found, because the symptom otherwise is a quietly worse failure count
--- rather than an error.
-stubIncludes :: FilePath
+-- Defaults to @bench\/include@, relative to the package root where @cabal
+-- bench@ runs. @AIHC_CPP_BENCH_INCLUDE@ overrides it with a colon-separated
+-- list, which is how the generated @cabal_macros.h@ is added: that one is
+-- snapshot-specific, so it lives in the download cache rather than the
+-- repository.
+stubIncludes :: [FilePath]
 stubIncludes = unsafeStubIncludes
 
 {-# NOINLINE unsafeStubIncludes #-}
-unsafeStubIncludes :: FilePath
+unsafeStubIncludes :: [FilePath]
 unsafeStubIncludes =
-  unsafePerformIO (fromMaybe ("bench" </> "include") <$> lookupEnv "AIHC_CPP_BENCH_INCLUDE")
+  unsafePerformIO
+    (maybe ["bench" </> "include"] (splitOn ':') <$> lookupEnv "AIHC_CPP_BENCH_INCLUDE")
 
--- | Say so if the stub headers are not where they are expected.
+-- | Report which stub directories were found, and which were not.
+--
+-- Worth saying out loud: a missing directory does not fail, it just means more
+-- modules do not resolve their includes, which shows up as a worse failure
+-- count with no indication of why.
 warnMissingStubs :: IO ()
 warnMissingStubs = do
-  present <- doesDirectoryExist stubIncludes
-  if present
-    then putStrLn ("stub headers: " <> stubIncludes)
-    else
-      putStrLn
-        ( "warning: no stub headers at "
-            <> stubIncludes
-            <> " (set AIHC_CPP_BENCH_INCLUDE); modules including MachDeps.h will not resolve"
-        )
+  mapM_ check stubIncludes
+  if BS.null preludeBytes
+    then putStrLn "prelude: none (set AIHC_CPP_BENCH_PRELUDE)"
+    else putStrLn ("prelude: " <> show (BS.length preludeBytes) <> " bytes prepended to every module")
+  where
+    check dir = do
+      present <- doesDirectoryExist dir
+      putStrLn $
+        if present
+          then "stub headers: " <> dir
+          else "warning: no stub headers at " <> dir <> " (set AIHC_CPP_BENCH_INCLUDE)"
 
 stripPrefixDir :: FilePath -> FilePath -> Maybe [FilePath]
 stripPrefixDir root path = go (splitDirectories root) (splitDirectories path)
