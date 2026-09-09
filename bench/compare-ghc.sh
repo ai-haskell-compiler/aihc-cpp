@@ -43,6 +43,12 @@ for tool in hyperfine python3; do
 done
 
 driver="$(cabal list-bin bench:driver | tail -1)"
+
+# hyperfine takes each command as a shell string, so anything interpolated into
+# one has to be quoted. The preprocessor is whatever `ghc --info` names, which
+# on a Nix or Windows install is an absolute path and not necessarily free of
+# spaces; the corpus root is user-supplied too.
+q() { printf '%q' "$1"; }
 "$driver" gen "$corpus" "$scale"
 
 # Ask GHC how it preprocesses Haskell, instead of assuming.
@@ -106,8 +112,8 @@ time_pair() {
 }
 
 time_pair startup "$workdir/startup.json" \
-  "$driver baseline $empty" \
-  "$cpp_command $cpp_flags -x c $empty"
+  "$(q "$driver") baseline $(q "$empty")" \
+  "$(q "$cpp_command") $cpp_flags -x c $(q "$empty")"
 
 json_files=("$workdir/startup.json")
 labels=("startup")
@@ -117,8 +123,8 @@ for pair in ${comparable[@]+"${comparable[@]}"}; do
   name="${pair%%:*}"
   entry="${pair#*:}"
   time_pair "$name" "$workdir/$name.json" \
-    "$driver preprocess $corpus/$entry" \
-    "$cpp_command $cpp_flags -I $corpus -x c $corpus/$entry"
+    "$(q "$driver") preprocess $(q "$corpus/$entry")" \
+    "$(q "$cpp_command") $cpp_flags -I $(q "$corpus") -x c $(q "$corpus/$entry")"
   json_files+=("$workdir/$name.json")
   labels+=("$name")
   sizes+=("$("$driver" bytes "$corpus/$entry")")

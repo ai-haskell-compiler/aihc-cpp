@@ -25,11 +25,16 @@ Current baseline:
 
 ## Benchmarking
 
-GHC does not preprocess Haskell itself: it invokes a C preprocessor with a fixed
-set of flags, both of which it reports through `ghc --info` (on a typical Unix
-install, `gcc -E -undef -traditional`). That command is what "against GHC" means
-here, and the harness reads it from `ghc --info` rather than hardcoding it, so it
-always measures against the preprocessor the local GHC would really run.
+GHC does not preprocess Haskell itself: it invokes an external C preprocessor
+with a fixed set of flags, both baked into `$(ghc --print-libdir)/settings` when
+GHC was built and reported by `ghc --info`. That command is what "against GHC"
+means here.
+
+It is not always `gcc`, which is why the harness reads it from `ghc --info`
+rather than hardcoding it. The two GHC 9.12.4 installs on the machine this was
+developed on disagree: a ghcup build says `gcc`, while a Nix build names an
+absolute path to a `clang` wrapper — and on macOS `/usr/bin/gcc` is itself
+Apple clang. Users can also override it per-invocation with `-pgmP`.
 
 There are two layers, because they answer different questions.
 
