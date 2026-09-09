@@ -21,17 +21,17 @@ import Aihc.Cpp.Cursor
     peekByte2,
     skipNewline,
     skipToInteresting,
-    sliceText,
+    sliceBytes,
   )
 import Aihc.Cpp.Evaluator (expandMacros, expandMacrosMultiline)
 import Aihc.Cpp.Types (EngineState)
-import Data.Text (Text)
-import qualified Data.Text as T
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as C
 import Prelude hiding (null)
 
 data LineSpan = LineSpan
   { lineSpanInBlockComment :: !Bool,
-    lineSpanText :: !Text
+    lineSpanText :: !ByteString
   }
 
 data LineScan = LineScan
@@ -41,9 +41,9 @@ data LineScan = LineScan
   }
 
 -- | Expand macros in a list of line spans (single-line, no lookahead).
-expandLineBySpan :: EngineState -> [LineSpan] -> Text
+expandLineBySpan :: EngineState -> [LineSpan] -> ByteString
 expandLineBySpan st =
-  T.concat . map expandSpan
+  C.concat . map expandSpan
   where
     expandSpan lineChunk
       | lineSpanInBlockComment lineChunk = lineSpanText lineChunk
@@ -57,35 +57,35 @@ expandLineBySpan st =
 -- Multi-line expansion is only attempted for lines that consist entirely
 -- of code spans (no inline comments). Mixed code/comment lines use
 -- single-line expansion to preserve comment span positions.
-expandLineBySpanMultiline :: EngineState -> [LineSpan] -> Cursor -> (Text, Int)
+expandLineBySpanMultiline :: EngineState -> [LineSpan] -> Cursor -> (ByteString, Int)
 expandLineBySpanMultiline st spans futureCursor =
   let commentSpans = filter lineSpanInBlockComment spans
-      hasLineComment = any (\s -> "--" `T.isPrefixOf` lineSpanText s) commentSpans
-      hasCBlockComment = any (T.all (== ' ') . lineSpanText) commentSpans
+      hasLineComment = any (\s -> "--" `C.isPrefixOf` lineSpanText s) commentSpans
+      hasCBlockComment = any (C.all (== ' ') . lineSpanText) commentSpans
       hasHsComment = case commentSpans of
         [] -> False
         _ -> not hasCBlockComment
    in if hasLineComment || hasHsComment
         then -- Haskell comments stay in the token stream, so expand the full line.
-          let fullText = T.concat [lineSpanText s | s <- spans]
+          let fullText = C.concat [lineSpanText s | s <- spans]
            in (expandMacros st fullText, 0)
         else
           if hasCBlockComment
             then -- C comments are stripped to spaces, so preserve per-span handling.
               (expandLineBySpan st spans, 0)
             else -- Pure code line: try multi-line expansion
-              let codeText = T.concat [lineSpanText s | s <- spans]
+              let codeText = C.concat [lineSpanText s | s <- spans]
                   futureCodeLines = cursorToLines futureCursor
                in expandMacrosMultiline st codeText futureCodeLines
 
--- | Extract lines from a cursor as a lazy list of Text values.
--- Each line is the text up to the next newline (or EOF).
-cursorToLines :: Cursor -> [Text]
+-- | Extract lines from a cursor as a lazy list of byte slices.
+-- Each line is the content up to the next newline (or EOF).
+cursorToLines :: Cursor -> [ByteString]
 cursorToLines !cur
   | null cur = []
   | otherwise =
       let eol = findNewline cur
-          lineText = sliceText (curPos cur) (curPos eol) cur
+          lineText = sliceBytes (curPos cur) (curPos eol) cur
        in lineText : maybe [] cursorToLines (skipNewline eol)
 
 -- | Lightweight scan that only tracks block comment depth changes.
@@ -140,7 +140,7 @@ scanLineDepthOnly = goDepth
 --
 -- The scanner splits the line into 'LineSpan' segments. Each segment is
 -- tagged with whether it is inside a block comment. Code spans (outside
--- comments) are zero-copy slices of the UTF-8 encoded input. C89 comment
+-- comments) are zero-copy slices of the raw input. C89 comment
 -- content is replaced with spaces to preserve column alignment.
 scanLine :: Int -> Int -> Cursor -> LineScan
 scanLine hsDepth0 cDepth0 cursor0 =
@@ -165,7 +165,7 @@ scanLine hsDepth0 cDepth0 cursor0 =
     emit :: [LineSpan] -> Int -> Int -> Cursor -> Bool -> [LineSpan]
     emit acc start end cur inComment
       | start >= end = acc
-      | otherwise = LineSpan inComment (sliceText start end cur) : acc
+      | otherwise = LineSpan inComment (sliceBytes start end cur) : acc
     {-# INLINE emit #-}
 
     go ::
@@ -246,7 +246,7 @@ scanLine hsDepth0 cDepth0 cursor0 =
                       && b2 == 0x2D -- '--'
                       then
                         let acc' = emit acc spanStart (curPos cur) cur spanInComment
-                            restText = sliceText (curPos cur) (bufLength cur) cur
+                            restText = sliceBytes (curPos cur) (bufLength cur) cur
                          in (LineSpan True restText : acc', hsDepth, cDepth)
                       -- === Inside string literal ===
                       else
