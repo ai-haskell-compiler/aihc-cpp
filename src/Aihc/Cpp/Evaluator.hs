@@ -208,7 +208,11 @@ expandIdentBlue st painted txt acc =
                     goText st painted False False False rest (acc <> BSB.byteString ident)
                   Just (args, restAfter)
                     | length args == length params ->
-                        let body' = substituteParamsBuilder (M.fromList (zip params args)) body
+                        -- Arguments are expanded in the caller's paint context,
+                        -- before @ident@ is painted, so a nested call to the
+                        -- same macro inside an argument still expands.
+                        let macroArgs = map (macroArg st painted) args
+                            body' = substituteMacroArgs (M.fromList (zip params macroArgs)) body
                             painted' = S.insert ident painted
                             expanded = builderToBytes (goText st painted' False False False body' mempty)
                          in goText st painted False False False restAfter (acc <> BSB.byteString expanded)
@@ -216,6 +220,20 @@ expandIdentBlue st painted txt acc =
                         goText st painted False False False rest (acc <> BSB.byteString ident)
               Nothing ->
                 goText st painted False False False rest (acc <> BSB.byteString ident)
+
+-- | A function-like macro argument in both the forms the replacement list
+-- can need: the raw spelling (used by @#@ and @##@, which see arguments
+-- unexpanded) and the macro-expanded spelling (used everywhere else).
+data MacroArg = MacroArg
+  { macroArgRaw :: !ByteString,
+    macroArgExpanded :: !ByteString
+  }
+
+-- | Build a 'MacroArg' by expanding the argument text in the paint context of
+-- the call site.
+macroArg :: EngineState -> Set ByteString -> ByteString -> MacroArg
+macroArg st painted raw =
+  MacroArg raw (builderToBytes (goText st painted False False False raw mempty))
 
 -- | Normalize comments inside object-like macro replacement text while
 -- preserving string and char literals. cpphs replaces @/* ... */@ with spaces
@@ -377,12 +395,15 @@ data Piece
   | PieceParam !ByteString
 
 substituteParams :: Map ByteString ByteString -> ByteString -> ByteString
-substituteParams = substituteParamsBuilder
+substituteParams subs = substituteMacroArgs (M.map (\arg -> MacroArg arg arg) subs)
 
 -- | Builder-based parameter substitution. Replaces identifiers found
 -- in the substitution map, respecting string and char literals.
-substituteParamsBuilder :: Map ByteString ByteString -> ByteString -> ByteString
-substituteParamsBuilder subs = renderPieces . collapseTokenPastes . collapseStringizing . tokenizeReplacementList
+--
+-- Parameters render as their macro-expanded argument, except as operands of
+-- @#@ and @##@, which use the raw argument text.
+substituteMacroArgs :: Map ByteString MacroArg -> ByteString -> ByteString
+substituteMacroArgs subs = renderPieces . collapseTokenPastes . collapseStringizing . tokenizeReplacementList
   where
     tokenizeReplacementList :: ByteString -> [Piece]
     tokenizeReplacementList txt =
@@ -428,7 +449,7 @@ substituteParamsBuilder subs = renderPieces . collapseTokenPastes . collapseStri
     collapseStringizing :: [Piece] -> [Piece]
     collapseStringizing [] = []
     collapseStringizing (PieceRaw "#" : PieceParam name : rest) =
-      PieceRaw (stringizeArgument (lookupParam name)) : collapseStringizing rest
+      PieceRaw (stringizeArgument (lookupParamRaw name)) : collapseStringizing rest
     collapseStringizing (PieceRaw "#" : rest) =
       PieceRaw "#" : collapseStringizing rest
     collapseStringizing (piece : rest) = piece : collapseStringizing rest
@@ -444,7 +465,7 @@ substituteParamsBuilder subs = renderPieces . collapseTokenPastes . collapseStri
                   (leadingSpace, restAfterSpace) = span isWhitespacePiece rest
                in case (unsnoc accNoSpace, restAfterSpace) of
                     (Just (accInit, leftPiece), rightPiece : remaining) ->
-                      go (accInit <> [PieceRaw (renderPiece leftPiece <> renderPiece rightPiece)]) remaining
+                      go (accInit <> [PieceRaw (renderPieceRaw leftPiece <> renderPieceRaw rightPiece)]) remaining
                     _ -> go (acc <> [PieceRaw "##"] <> leadingSpace) restAfterSpace
             _ -> go (acc <> [piece]) rest
 
@@ -464,19 +485,29 @@ substituteParamsBuilder subs = renderPieces . collapseTokenPastes . collapseStri
     isWhitespacePiece (PieceWhitespace _) = True
     isWhitespacePiece _ = False
 
-    lookupParam :: ByteString -> ByteString
-    lookupParam name = M.findWithDefault name name subs
+    lookupParamWith :: (MacroArg -> ByteString) -> ByteString -> ByteString
+    lookupParamWith field name = maybe name field (M.lookup name subs)
+
+    lookupParamRaw :: ByteString -> ByteString
+    lookupParamRaw = lookupParamWith macroArgRaw
 
     renderPieces :: [Piece] -> ByteString
     renderPieces = C.concat . map renderPiece
 
     renderPiece :: Piece -> ByteString
-    renderPiece piece =
+    renderPiece = renderPieceWith macroArgExpanded
+
+    -- \| Render an operand of @##@, which sees the raw argument text.
+    renderPieceRaw :: Piece -> ByteString
+    renderPieceRaw = renderPieceWith macroArgRaw
+
+    renderPieceWith :: (MacroArg -> ByteString) -> Piece -> ByteString
+    renderPieceWith field piece =
       case piece of
         PieceWhitespace txt -> txt
         PiecePaste -> "##"
         PieceRaw txt -> txt
-        PieceParam name -> lookupParam name
+        PieceParam name -> lookupParamWith field name
 
     stringizeArgument :: ByteString -> ByteString
     stringizeArgument arg =

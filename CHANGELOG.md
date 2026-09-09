@@ -32,7 +32,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Data.Char.isSpace` on a byte treated `0xA0` — an ordinary UTF-8
   continuation byte — as whitespace, which could split a multi-byte
   character in half.
-
+- Macro arguments are now expanded before substitution, so a function-like
+  macro invocation produced by an expansion is rescanned and expanded, matching
+  GHC's C preprocessor and `cpphs`. The C standard's non-recursive-expansion
+  rule is honoured, so a macro is never expanded inside its own expansion.
 - A pragma nested inside a Haskell block comment no longer terminates that
   comment. `{-#` is treated as a pragma delimiter only outside a comment;
   inside one it counts as an ordinary nested `{-`, balancing the `-}` of the
