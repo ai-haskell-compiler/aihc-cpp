@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Macro arguments are now expanded before substitution, so a function-like
+  macro invocation produced by an expansion is rescanned and expanded, matching
+  GHC's C preprocessor and `cpphs`. The C standard's non-recursive-expansion
+  rule is honoured, so a macro is never expanded inside its own expansion.
+
 ## [1.0.0.3] - 2026-07-26
 
 ### Changed

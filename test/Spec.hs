@@ -20,7 +20,7 @@ main = do
         "cpp-oracle"
         ( checks
             <> [linePragmaTest, dateTimeTest, functionMacroArgumentTest, functionMacroUnclosedCallTest, definedConditionSpacingTest, stringContinuationTests, tokenPastingTests, ccallLineCommentTest]
-            <> [pragmaOnceTest]
+            <> [pragmaOnceTest, macroRescanTests]
             <> [QC.testProperty "dummy quickcheck property" prop_dummy]
         )
     )
@@ -224,6 +224,38 @@ pragmaOnceTest =
               then pure ()
               else assertFailure ("expected guarded include once, got: " <> show output)
       Done _ -> assertFailure "expected include continuation step"
+
+-- | Rescanning of macro expansion results, and the C standard's
+-- non-recursive-expansion ("blue paint") rule that keeps it terminating.
+--
+-- These live here rather than in the progress corpus because cpphs, the
+-- oracle that corpus compares against, has no recursion guard and diverges
+-- on every self-referential case below.
+macroRescanTests :: TestTree
+macroRescanTests =
+  testGroup
+    "macro rescanning"
+    [ testCase "self-referential object macro expands exactly once" $
+        assertPreprocessOutput
+          (T.unlines ["#define SELF SELF", "e = SELF"])
+          (T.unlines ["#line 1 \"<input>\"", "", "e = SELF"]),
+      testCase "self-referential object macro keeps surrounding tokens" $
+        assertPreprocessOutput
+          (T.unlines ["#define SELF x + SELF", "e = SELF"])
+          (T.unlines ["#line 1 \"<input>\"", "", "e = x + SELF"]),
+      testCase "self-referential function macro expands exactly once" $
+        assertPreprocessOutput
+          (T.unlines ["#define REC(x) REC(x)", "f = REC(1)"])
+          (T.unlines ["#line 1 \"<input>\"", "", "f = REC(1)"]),
+      testCase "mutually recursive function macros terminate" $
+        assertPreprocessOutput
+          (T.unlines ["#define PING(x) PONG(x)", "#define PONG(x) PING(x)", "g = PING(2)"])
+          (T.unlines ["#line 1 \"<input>\"", "", "", "g = PING(2)"]),
+      testCase "paint does not leak into a nested call of the same macro" $
+        assertPreprocessOutput
+          (T.unlines ["#define F(x) (x)", "#define G(x) F(x) + F(F(x))", "h = G(3)"])
+          (T.unlines ["#line 1 \"<input>\"", "", "", "h = (3) + ((3))"])
+    ]
 
 ccallLineCommentInput :: T.Text
 ccallLineCommentInput =
