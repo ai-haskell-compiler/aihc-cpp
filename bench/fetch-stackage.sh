@@ -27,22 +27,25 @@ src="$cache/src"
 mkdir -p "$tarballs" "$src"
 
 manifest="$cache/packages.txt"
-if [ ! -s "$manifest" ]; then
+# Only the snapshot's package list is cached. The selection is recomputed every
+# run, so changing the package count takes effect without clearing the cache.
+if [ ! -s "$manifest.all" ]; then
   echo "fetching package list for $snapshot"
   curl -sSf --max-time 120 "https://www.stackage.org/$snapshot/cabal.config" |
     sed -n 's/^[[:space:]]*\([A-Za-z0-9][A-Za-z0-9-]*\)[[:space:]]*==[[:space:]]*\([0-9][0-9.]*\).*/\1-\2/p' |
     sort -u >"$manifest.all"
-  total="$(wc -l <"$manifest.all" | tr -d ' ')"
-  if [ "$limit" -gt 0 ] && [ "$total" -gt "$limit" ]; then
-    # Take every Nth package so the sample spans the whole list rather than
-    # stopping in the a's.
-    stride=$((total / limit))
-    awk -v n="$stride" 'NR % n == 1' "$manifest.all" >"$manifest"
-  else
-    cp "$manifest.all" "$manifest"
-  fi
-  echo "selected $(wc -l <"$manifest" | tr -d ' ') of $total packages"
 fi
+total="$(wc -l <"$manifest.all" | tr -d ' ')"
+if [ "$limit" -gt 0 ] && [ "$total" -gt "$limit" ]; then
+  # Take every Nth package so the sample spans the whole list rather than
+  # stopping in the a's. A larger count is a superset of a smaller one, so
+  # widening the corpus only downloads what is missing.
+  stride=$((total / limit))
+  awk -v n="$stride" 'NR % n == 1' "$manifest.all" >"$manifest"
+else
+  cp "$manifest.all" "$manifest"
+fi
+echo "selected $(wc -l <"$manifest" | tr -d ' ') of $total packages"
 
 fetch_one() {
   pkg="$1"

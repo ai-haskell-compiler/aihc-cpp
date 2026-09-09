@@ -80,14 +80,15 @@ selectCorpus = maybe (Generated defaultCorpusRoot) RealWorld <$> lookupEnv "AIHC
 -- The corpus is held in memory three times over, once in each preprocessor's
 -- input type, and a Haskell 'String' costs upwards of sixteen bytes per
 -- character — so a few megabytes of source becomes a few hundred megabytes of
--- residency. The default samples a few hundred modules and peaks around 435MB,
--- against the 512MB heap cap this binary carries. Raise it with
--- @AIHC_CPP_BENCH_MAX_BYTES@ for wider coverage — 8MB has been measured at
--- roughly the same residency — and lower it if the cap is ever hit.
+-- residency. Only the bytes are held now (see 'tools'), so the budget buys
+-- much more coverage than it used to, but outputs and collector headroom still
+-- scale with it: 8MB samples several hundred modules, 16MB samples about
+-- eleven hundred and peaks near 590MB against the 512MB heap cap this binary
+-- carries. Raise it for wider coverage and lower it if the cap is ever hit.
 byteBudget :: IO Int
 byteBudget = maybe defaultBudget read <$> lookupEnv "AIHC_CPP_BENCH_MAX_BYTES"
   where
-    defaultBudget = 4 * 1024 * 1024
+    defaultBudget = 8 * 1024 * 1024
 
 -- | Every @.hs@ file under a directory.
 --
@@ -155,22 +156,31 @@ usesCpp = any isDirective . BS8.lines
     directives =
       ["if", "ifdef", "ifndef", "elif", "else", "endif", "define", "undef", "include"]
 
--- | An input preloaded in each preprocessor's own input type.
+-- | An input, read from disk once.
 --
--- The conversions happen before timing starts, so no tool is charged for the
--- shape of its own API.
+-- Only the bytes are held. The two other input shapes the tools want are built
+-- inside the timed region, per iteration, and discarded — see 'tools'.
 data Prepared = Prepared
   { prepPath :: !FilePath,
-    prepBytes :: !BS.ByteString,
-    prepString :: !String,
-    prepLines :: ![BS.ByteString]
+    prepBytes :: !BS.ByteString
   }
 
--- | The three preprocessors behind one interface.
+-- | The three preprocessors behind one interface, plus the cost of feeding one.
 --
 -- Each forces its output completely and returns the length, so that no tool
 -- benefits from leaving a lazy structure unevaluated and all three are charged
 -- for producing the whole result.
+--
+-- Each also converts the input into the shape its own API demands, inside the
+-- timed region. cpphs takes a 'String', and holding the whole corpus as one
+-- costs about seventy bytes per source character once the collector\'s copying
+-- space is counted — on a 4MB corpus that was 290MB of the 417MB peak, and it
+-- was the reason the corpus had to stay small. Doing it per iteration instead
+-- keeps one module\'s worth live rather than the whole corpus.
+--
+-- That does charge cpphs for marshalling that is not preprocessing, so the cost
+-- is measured too: the @(input marshalling)@ entry does the 'String' conversion
+-- and nothing else. Subtract it from cpphs to recover a like-for-like number.
 tools :: [(String, FilePath -> Prepared -> IO Int)]
 tools =
   [ ( "aihc-cpp",
@@ -180,13 +190,16 @@ tools =
     ),
     ( "hpp",
       \root p -> do
-        out <- hpp root p
+        out <- hpp root p (BS8.lines (prepBytes p))
         sum . map BS.length <$> evaluate (force out)
     ),
     ( "cpphs",
       \root p -> do
-        out <- runCpphs (cpphsOptions root) (prepPath p) (prepString p)
+        out <- runCpphs (cpphsOptions root) (prepPath p) (BS8.unpack (prepBytes p))
         length <$> evaluate (force out)
+    ),
+    ( "(input marshalling)",
+      \_ p -> length <$> evaluate (force (BS8.unpack (prepBytes p)))
     )
   ]
 
@@ -232,11 +245,7 @@ safely :: IO Int -> IO Int
 safely act = fromRight 0 <$> (try act :: IO (Either SomeException Int))
 
 prepare :: FilePath -> IO Prepared
-prepare path = do
-  bytes <- BS.readFile path
-  Prepared path bytes
-    <$> evaluate (force (BS8.unpack bytes))
-    <*> evaluate (force (BS8.lines bytes))
+prepare path = Prepared path <$> BS.readFile path
 
 -- | Describe the discovered corpus, and how much of it each tool can handle.
 reportCorpus :: FilePath -> Int -> [Prepared] -> IO ()
@@ -255,20 +264,24 @@ reportCorpus root found prepared = do
   mapM_ report tools
   where
     report (name, run) = do
-      outcomes <- mapM (\p -> try (run root p) :: IO (Either SomeException Int)) prepared
-      let failures = length [() | Left _ <- outcomes]
-          produced = sum (rights outcomes)
+      outcomes <- mapM (\p -> (,) (prepPath p) <$> (try (run root p) :: IO (Either SomeException Int))) prepared
+      let failed = [(path, show err) | (path, Left err) <- outcomes]
+          produced = sum (rights (map snd outcomes))
       putStrLn
         ( "  "
             <> name
             <> ": "
-            <> show (length prepared - failures)
+            <> show (length prepared - length failed)
             <> " ok, "
-            <> show failures
+            <> show (length failed)
             <> " failed, "
             <> show (produced `div` 1024)
             <> " KiB out"
         )
+      -- Name the first few failures. A tool that crashes on real input is
+      -- doing less work than the others, and if it is aihc-cpp it is a bug
+      -- report rather than a benchmark result.
+      mapM_ (\(path, err) -> putStrLn ("      failed: " <> path <> ": " <> err)) (take 3 failed)
 
 -- | Print how much output each tool produces on a generated case.
 --
@@ -286,13 +299,13 @@ reportOne root (c, p) = do
     )
 
 -- | Run hpp over the preloaded lines, returning its output chunks.
-hpp :: FilePath -> Prepared -> IO [BS.ByteString]
-hpp root p = do
+hpp :: FilePath -> Prepared -> [BS.ByteString] -> IO [BS.ByteString]
+hpp root p inputLines = do
   result <-
     runExceptT
       ( Hpp.runHpp
           (Hpp.initHppState (hppConfig root (prepPath p)) mempty)
-          (Hpp.preprocess (prepLines p))
+          (Hpp.preprocess inputLines)
       )
   case result of
     Left err -> error ("hpp failed on " <> prepPath p <> ": " <> show err)

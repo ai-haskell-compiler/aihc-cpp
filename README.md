@@ -46,24 +46,38 @@ just bench-stackage
 
 The first run downloads and extracts into `dist-newstyle/`; later runs reuse it.
 By default it takes a stride of 400 packages through the snapshot's 3,441, which
-spans the list while keeping the download to a few hundred megabytes. Set
-`AIHC_CPP_STACKAGE_PACKAGES=0` for the whole snapshot.
+spans the list while keeping the download to a few hundred megabytes. Raise
+`AIHC_CPP_STACKAGE_PACKAGES` for more (a larger count is a superset, so only the
+missing packages are fetched) or set it to `0` for the whole snapshot.
 
-Over 434 CPP-using modules (4.1 MB) from 426 Stackage packages, on an M-series
-Mac with GHC 9.12.4:
+Over 570 CPP-using modules (8.0 MB) sampled from 1,702 Stackage packages, on an
+M-series Mac with GHC 9.12.4:
 
 | | time | modules preprocessed | output |
 | --- | --- | --- | --- |
-| aihc-cpp | 165 ms | 434 / 434 | 3810 KiB |
-| cpphs | 300 ms | 429 / 434 | 3808 KiB |
-| hpp | 1.89 s | 366 / 434 | 3103 KiB |
+| aihc-cpp | 295 ms | 569 / 570 | 7909 KiB |
+| cpphs | 438 ms | 566 / 570 | 7781 KiB |
+| hpp | 3.27 s | 523 / 570 | 6766 KiB |
+| *(input marshalling)* | *58.9 ms* | — | — |
 
-Read the failure column alongside the times. Real modules reference headers that
-are absent and macros that are never defined, the three tools disagree about
-which of those is fatal, and a tool that gives up early does less work — hpp is
-slowest while producing about four fifths of the output. Widening the sample to
-640 modules does not change the ranking (aihc-cpp 277 ms, cpphs 481 ms, hpp
-3.22 s).
+Two things to read alongside the times.
+
+The failure column: real modules reference headers that are absent and macros
+that are never defined, and the three tools disagree about which of those is
+fatal — hpp treats a missing `#include` as an error and stops, where the other
+two carry on. A tool that gives up early does less work, so hpp is slowest while
+producing about six sevenths of the output. (aihc-cpp's one failure is a bug: it
+throws rather than reporting a diagnostic on a module that is Latin-1 rather
+than UTF-8.)
+
+The marshalling row: cpphs takes a `String`, so its time includes converting the
+input from bytes. That conversion is measured on its own and is not
+preprocessing — subtract it for a like-for-like comparison, which puts cpphs at
+roughly 379 ms against aihc-cpp's 295 ms. It is charged rather than preloaded
+because holding the whole corpus as a `String` costs around seventy bytes per
+source character once the collector's copying space is counted; preloading it
+capped the corpus at a few hundred modules, and the resulting GC pressure made
+cpphs look *slower* than it does now.
 
 Any directory of Haskell source works, not just the Stackage cache:
 
@@ -71,9 +85,9 @@ Any directory of Haskell source works, not just the Stackage cache:
 AIHC_CPP_BENCH_CORPUS=/path/to/checkout just bench
 ```
 
-The sample is bounded by `AIHC_CPP_BENCH_MAX_BYTES` (4 MB by default), because
-the corpus is held in memory three times over and a Haskell `String` costs
-upwards of sixteen bytes per character. Modules are taken at an even stride
+The sample is bounded by `AIHC_CPP_BENCH_MAX_BYTES` (8 MB by default); outputs
+and collector headroom scale with it, and 16 MB samples about eleven hundred
+modules at close to the binary's heap cap. Modules are taken at an even stride
 through the sorted file list, so the sample spans the tree rather than stopping
 inside whichever package sorts first, and the same modules are chosen every run.
 
