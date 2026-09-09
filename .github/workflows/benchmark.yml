@@ -1,0 +1,147 @@
+name: Stackage Benchmark
+
+# Sweeps every CPP-using module in a pinned Stackage snapshot and opens a pull
+# request with the results, so a change in what the preprocessor can handle
+# shows up as a reviewable diff rather than going unnoticed.
+#
+# Weekly rather than per-commit: the corpus is a gigabyte of downloads and the
+# signal being tracked — how many real modules preprocess, and how much output
+# they produce — moves slowly.
+
+on:
+  schedule:
+    # Mondays, 04:00 UTC.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stackage-benchmark
+  cancel-in-progress: false
+
+env:
+  SNAPSHOT: lts-24.58
+
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: setup-haskell
+        uses: haskell-actions/setup@v2.11.0
+        with:
+          ghc-version: 9.12.4
+          cabal-version: 3.16.0.0
+
+      # Only the package store: dist-newstyle also holds the corpus, which is
+      # cached separately, and overlapping cache paths fight each other.
+      - uses: actions/cache@v6
+        with:
+          path: ${{ steps.setup-haskell.outputs.cabal-store }}
+          key: bench-${{ runner.os }}-${{ hashFiles('*.cabal', 'cabal.project') }}
+
+      # Cached separately and keyed on the snapshot: the package set is
+      # immutable, so this only ever downloads once per snapshot bump. A cache
+      # miss costs a few minutes, not a failure.
+      - uses: actions/cache@v6
+        with:
+          path: dist-newstyle/stackage/${{ env.SNAPSHOT }}/tarballs
+          key: stackage-tarballs-${{ env.SNAPSHOT }}
+
+      - run: cabal update
+
+      - name: Build the benchmark
+        run: cabal build bench:micro
+
+      - name: Fetch the snapshot
+        env:
+          AIHC_CPP_STACKAGE_SNAPSHOT: ${{ env.SNAPSHOT }}
+          AIHC_CPP_STACKAGE_PACKAGES: "0"
+        run: ./bench/fetch-stackage.sh
+
+      - name: Sweep
+        env:
+          AIHC_CPP_BENCH_CORPUS: dist-newstyle/stackage/${{ env.SNAPSHOT }}/src
+          AIHC_CPP_BENCH_SWEEP: "1"
+        run: |
+          "$(cabal list-bin bench:micro | tail -1)" >sweep.txt 2>/dev/null
+          cat sweep.txt
+
+      - name: Update the results table
+        run: |
+          # Keep only the table, dropping the per-tool failure lines the sweep
+          # prints beneath it: those name individual modules and would make the
+          # weekly diff unreadable.
+          {
+            echo '```'
+            grep -E '^(tool |-----|aihc-cpp|cpphs|hpp|\(read)' sweep.txt
+            echo '```'
+          } >table.txt
+          python3 - <<'PY'
+          import re, pathlib
+          start = "<!-- AUTO-GENERATED: START stackage-sweep -->"
+          end = "<!-- AUTO-GENERATED: END stackage-sweep -->"
+          results = pathlib.Path("bench/RESULTS.md")
+          table = pathlib.Path("table.txt").read_text().rstrip()
+          text = results.read_text()
+          replaced = re.sub(
+              re.escape(start) + r".*?" + re.escape(end),
+              f"{start}\n{table}\n{end}",
+              text,
+              flags=re.DOTALL,
+          )
+          if replaced == text:
+              raise SystemExit("markers not found or table unchanged in bench/RESULTS.md")
+          results.write_text(replaced)
+          PY
+          rm -f sweep.txt table.txt
+
+      - name: Open a pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- bench/RESULTS.md; then
+            echo "results unchanged; nothing to open"
+            exit 0
+          fi
+
+          branch="bench/stackage-$(date -u +%Y-%m-%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add bench/RESULTS.md
+          git commit -m "chore(bench): weekly ${SNAPSHOT} sweep"
+
+          # The branch name carries only the date, so a same-day re-run pushes
+          # over its own earlier attempt rather than failing.
+          git push --force -u origin "$branch"
+
+          {
+            echo "Weekly sweep of every CPP-using module in \`${SNAPSHOT}\`."
+            echo
+            echo "Review the **ok / errored / crashed / MiB out** columns: those are"
+            echo "deterministic, so a change means preprocessing behaviour changed."
+            echo "The seconds column comes from one pass on a shared runner and moves"
+            echo "by 10% or more for reasons unrelated to this repository."
+            echo
+            echo '```diff'
+            git diff HEAD~1 HEAD -- bench/RESULTS.md | tail -n +5
+            echo '```'
+          } >body.md
+
+          if [ -n "$(gh pr list --head "$branch" --state open --json number --jq '.[].number')" ]; then
+            echo "a pull request for $branch is already open; it now has the new commit"
+            exit 0
+          fi
+
+          gh pr create \
+            --title "chore(bench): weekly ${SNAPSHOT} sweep" \
+            --body-file body.md \
+            --base "${GITHUB_REF_NAME}"

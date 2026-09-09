@@ -147,6 +147,12 @@ __GLASGOW_HASKELL__` guards around `#error This code isn't being built with GHC`
 are now correctly skipped — and all three produce more output, which is the
 point: more of the corpus is code a real build would actually compile.
 
+Results are tracked in [`bench/RESULTS.md`](bench/RESULTS.md), regenerated
+weekly by `.github/workflows/benchmark.yml`, which opens a pull request with the
+new table. Review the counts rather than the clock: `ok`, `errored`, `crashed`
+and `MiB out` are deterministic, while a single pass on a shared CI runner moves
+by 10% or more between runs.
+
 #### Sampled benchmark
 
 ```bash
