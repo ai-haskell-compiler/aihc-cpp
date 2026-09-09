@@ -111,6 +111,26 @@ shared one cannot be.
 The remaining unresolved includes are package-local headers kept in directories
 Cabal is told about individually, and generated files like `ghclib_api.h`.
 
+#### Macros the compiler supplies
+
+`__GLASGOW_HASKELL__` is the most referenced macro in real Haskell — around a
+thousand modules test it — and GHC passes it with `-D` rather than putting it in
+a header, so no amount of include-path fixing makes it appear. Left undefined it
+is zero in an `#if`, which is not an error but silently sends every version test
+down its oldest branch, so the corpus preprocesses code no real build would.
+
+All three tools are given it, along with the two patchlevel macros, through
+their own predefined-macro APIs (`configMacros`, cpphs's `defines`, hpp's
+`addDefinition`). The value follows the compiler the pinned snapshot names —
+`with-compiler: ghc-9.10.3` for lts-24.58, so `910` in GHC's `major*100+minor`
+encoding — and should be bumped with the snapshot.
+
+Defining it took cpphs's crashes from 30 to 18, because `#ifndef
+__GLASGOW_HASKELL__` guards around `#error This code isn't being built with GHC`
+are now correctly skipped, and aihc-cpp's errors from 251 to 239. All three
+produce more output, which is the point: more of the corpus is code a real build
+would actually compile.
+
 #### Sampled benchmark
 
 ```bash

@@ -47,6 +47,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import Data.Either (fromRight, rights)
 import Data.List (isPrefixOf, isSuffixOf, sort)
+import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe)
 import GHC.Clock (getMonotonicTime)
 import GHC.Generics (Generic)
@@ -448,12 +449,19 @@ hpp dirs p inputLines = do
   result <-
     runExceptT
       ( Hpp.runHpp
-          (Hpp.initHppState (hppConfig dirs (prepPath p)) mempty)
+          (hppState (hppConfig dirs (prepPath p)))
           (Hpp.preprocess inputLines)
       )
   case result of
     Left err -> error ("hpp failed on " <> prepPath p <> ": " <> show err)
     Right (out, _) -> pure (Hpp.hppOutput out)
+
+-- | hpp's initial state, carrying the same predefined macros as the others.
+hppState :: HppConfig.Config -> Hpp.HppState
+hppState config = foldl' define (Hpp.initHppState config mempty) predefinedMacros
+  where
+    define st (name, value) =
+      fromMaybe (error ("hpp rejected -D" <> BS8.unpack name)) (Hpp.addDefinition name value st)
 
 hppConfig :: [FilePath] -> FilePath -> HppConfig.Config
 hppConfig dirs path =
@@ -472,7 +480,8 @@ cpphsOptions :: [FilePath] -> CpphsOptions
 cpphsOptions dirs =
   defaultCpphsOptions
     { boolopts = (boolopts defaultCpphsOptions) {stripC89 = True, warnings = False},
-      includes = dirs
+      includes = dirs,
+      defines = [(BS8.unpack name, BS8.unpack value) | (name, value) <- predefinedMacros]
     }
 
 -- | Where to look for an @#include@ target, beyond the including file's own
@@ -493,6 +502,25 @@ searchPath root p = stubIncludes <> [packageDir </> "include", packageDir, root]
     packageDir = case stripPrefixDir root (prepPath p) of
       Just (component : _) -> root </> component
       _ -> takeDirectory (prepPath p)
+
+-- | Macros the compiler defines, which no header supplies.
+--
+-- @__GLASGOW_HASKELL__@ is the single most referenced macro in real Haskell —
+-- around a thousand modules in a snapshot test it — and GHC passes it with
+-- @-D@ rather than putting it in a header, so no amount of include-path
+-- fixing makes it appear. Left undefined it is zero in an @#if@, which is not
+-- an error but silently sends every version test down its oldest branch, so
+-- the corpus preprocesses code that no real build would.
+--
+-- The value tracks the compiler the pinned snapshot names (@with-compiler:
+-- ghc-9.10.3@ for lts-24.58), in GHC\'s major*100+minor encoding. Bump it with
+-- the snapshot.
+predefinedMacros :: [(BS.ByteString, BS.ByteString)]
+predefinedMacros =
+  [ ("__GLASGOW_HASKELL__", "910"),
+    ("__GLASGOW_HASKELL_PATCHLEVEL1__", "3"),
+    ("__GLASGOW_HASKELL_PATCHLEVEL2__", "0")
+  ]
 
 -- | Directories holding stand-ins for headers a real build would supply.
 --
@@ -539,8 +567,13 @@ stripPrefixDir root path = go (splitDirectories root) (splitDirectories path)
 -- other two cannot have.
 runAihc :: [FilePath] -> FilePath -> BS.ByteString -> IO Result
 runAihc dirs path source =
-  go (preprocess (defaultConfig {configInputFile = path}) source)
+  go (preprocess config source)
   where
+    config =
+      defaultConfig
+        { configInputFile = path,
+          configMacros = M.union (M.fromList predefinedMacros) (configMacros defaultConfig)
+        }
     go (Done r) = pure r
     go (NeedInclude req k) = do
       contents <- firstExisting (candidates req)
