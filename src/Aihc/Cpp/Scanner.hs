@@ -133,7 +133,7 @@ scanLineDepthOnly = goDepth
 
 -- | Scan a line, tracking comment depths and splitting into spans that are
 -- either inside or outside block comments. Uses a byte-level cursor for
--- efficient scanning instead of character-by-character T.uncons/T.cons.
+-- efficient scanning instead of character-by-character uncons/cons.
 --
 -- Accepts a 'Cursor' positioned at the start of the line content.
 -- The cursor should be bounded to the line (e.g., via 'lineSlice').

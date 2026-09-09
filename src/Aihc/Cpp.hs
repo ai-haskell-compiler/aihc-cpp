@@ -103,7 +103,7 @@ import System.FilePath (takeDirectory, (</>))
 -- Object-like macros are expanded in the output:
 --
 -- >>> let Done r = preprocess defaultConfig "#define FOO 42\nThe answer is FOO"
--- >>> T.putStr (resultOutput r)
+-- >>> C.putStr (resultOutput r)
 -- #line 1 "<input>"
 -- <BLANKLINE>
 -- The answer is 42
@@ -111,7 +111,7 @@ import System.FilePath (takeDirectory, (</>))
 -- Function-like macros are also supported:
 --
 -- >>> let Done r = preprocess defaultConfig "#define MAX(a,b) ((a) > (b) ? (a) : (b))\nMAX(3, 5)"
--- >>> T.putStr (resultOutput r)
+-- >>> C.putStr (resultOutput r)
 -- #line 1 "<input>"
 -- <BLANKLINE>
 -- ((3) > (5) ? (3) : (5))
@@ -123,7 +123,7 @@ import System.FilePath (takeDirectory, (</>))
 -- >>> :{
 -- let Done r = preprocess defaultConfig
 --       "#define DEBUG 1\n#if DEBUG\ndebug mode\n#else\nrelease mode\n#endif"
--- in T.putStr (resultOutput r)
+-- in C.putStr (resultOutput r)
 -- :}
 -- #line 1 "<input>"
 -- <BLANKLINE>
@@ -142,7 +142,7 @@ import System.FilePath (takeDirectory, (</>))
 -- >>> :{
 -- let NeedInclude req k = preprocess defaultConfig "#include \"header.h\"\nmain code"
 --     Done r = k (Just "-- header content")
--- in T.putStr (resultOutput r)
+-- in C.putStr (resultOutput r)
 -- :}
 -- #line 1 "<input>"
 -- #line 1 "./header.h"
@@ -156,7 +156,7 @@ import System.FilePath (takeDirectory, (</>))
 -- let NeedInclude _ k = preprocess defaultConfig "#include \"missing.h\""
 --     Done r = k Nothing
 -- in do
---   T.putStr (resultOutput r)
+--   C.putStr (resultOutput r)
 --   mapM_ print (resultDiagnostics r)
 -- :}
 -- #line 1 "<input>"
@@ -169,7 +169,7 @@ import System.FilePath (takeDirectory, (</>))
 -- >>> :{
 -- let Done r = preprocess defaultConfig "#warning This is a warning"
 -- in do
---   T.putStr (resultOutput r)
+--   C.putStr (resultOutput r)
 --   mapM_ print (resultDiagnostics r)
 -- :}
 -- #line 1 "<input>"
@@ -181,7 +181,7 @@ import System.FilePath (takeDirectory, (</>))
 -- >>> :{
 -- let Done r = preprocess defaultConfig "#error Build failed\nthis line is not processed"
 -- in do
---   T.putStr (resultOutput r)
+--   C.putStr (resultOutput r)
 --   mapM_ print (resultDiagnostics r)
 -- :}
 -- #line 1 "<input>"
@@ -198,11 +198,13 @@ import System.FilePath (takeDirectory, (</>))
 -- through unchanged, and no input can make 'preprocess' fail to decode
 -- something or raise an exception.
 --
+-- Byte 169 (0xA9, a Latin-1 copyright sign) is neither decoded nor
+-- rewritten; it is shown escaped here only because that keeps this
+-- example's output pure ASCII:
+--
 -- >>> let Done r = preprocess defaultConfig "-- \169 2026\nx = 1\n"
--- >>> C.putStr (resultOutput r)
--- #line 1 "<input>"
--- -- \169 2026
--- x = 1
+-- >>> resultOutput r
+-- "#line 1 \"<input>\"\n-- \169 2026\nx = 1\n"
 --
 -- This is deliberately looser than GHC, which decodes source as UTF-8 --
 -- but only where it must lex a token. GHC accepts an undecodable byte
