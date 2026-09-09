@@ -25,72 +25,53 @@ Current baseline:
 
 ## Benchmarking
 
-GHC does not preprocess Haskell itself: it invokes an external C preprocessor
-with a fixed set of flags, both baked into `$(ghc --print-libdir)/settings` when
-GHC was built and reported by `ghc --info`. That command is what "against GHC"
-means here.
-
-It is not always `gcc`, which is why the harness reads it from `ghc --info`
-rather than hardcoding it. The two GHC 9.12.4 installs on the machine this was
-developed on disagree: a ghcup build says `gcc`, while a Nix build names an
-absolute path to a `clang` wrapper — and on macOS `/usr/bin/gcc` is itself
-Apple clang. Users can also override it per-invocation with `-pgmP`.
-
-There are two layers, because they answer different questions.
-
 ```bash
 just bench
 ```
 
-In-process, aihc-cpp against [cpphs], the other pure-Haskell C preprocessor.
-Both are called as libraries on the same preloaded bytes with results forced to
-normal form, so nothing but preprocessing is timed. This is the layer to watch
-for regressions.
+Measures raw throughput against the other two pure-Haskell C preprocessors on
+Hackage, [hpp] and [cpphs]. All three run in-process as libraries, on the same
+preloaded bytes, with output forced to normal form, so the only thing timed is
+preprocessing — no process startup, no reading the entry file, no lazy IO left
+unevaluated.
 
-```bash
-just bench-ghc
-```
+Indicative figures on an M-series Mac, GHC 9.12.4:
 
-Process against process, aihc-cpp against GHC's C preprocessor. Requires
-`hyperfine`, which the dev shell provides.
-
-### What makes the comparison fair
-
-A one-shot process spends most of its wall clock not preprocessing, and the two
-sides do not pay the same fixed cost — an RTS is not a compiler driver. Timing
-`aihc-cpp file.hs` against `cpp file.hs` on a 100KB input measures startup, and
-gets the answer backwards: by raw wall clock aihc-cpp looks 1.6x *faster*, while
-the preprocessing itself is several times slower. The harness therefore:
-
-- **Gates on output parity.** Each side's output is normalised — line markers
-  resolved to explicit positions, blank lines and interior whitespace dropped —
-  and diffed before anything is timed. Inputs the two disagree on are reported
-  and excluded, because tools producing different output are not doing the same
-  work. Note this gate is deliberately looser than the correctness oracle in
-  `test/`, which compares exactly; parity here only decides what is comparable.
-- **Excludes known-divergent inputs by design.** aihc-cpp is Haskell-aware and
-  will not expand macros inside Haskell block comments or string literals, which
-  GHC's C preprocessor happily does. That case is benchmarked in-process only,
-  and reported rather than hidden.
-- **Runs both sides the same way.** A fresh process reading a file and writing
-  to stdout. Neither side gets credit for being a library.
-- **Subtracts each side's own startup.** Measured by copying a file through
-  untouched (aihc-cpp) and preprocessing an empty file (GHC's preprocessor).
-- **Scales the corpus up** (`AIHC_CPP_BENCH_SCALE`, default 10x) so the work
-  being measured survives that subtraction, and flags rows where it did not.
+| case | aihc-cpp | hpp | cpphs |
+| --- | --- | --- | --- |
+| passthrough | 2.45 ms | 57.7 ms | 3.03 ms |
+| conditionals | 2.87 ms | 46.0 ms | 6.55 ms |
+| macros | 9.39 ms | 142 ms | 10.9 ms |
+| literals | 6.26 ms | 69.4 ms | 4.19 ms |
+| includes | 14.2 ms | 164 ms | 13.3 ms |
 
 The corpus is generated, deterministic, and weighted towards the case that
 dominates real modules: thousands of lines the preprocessor merely copies, with
-a few directives at the top. It is written under `dist-newstyle/`, away from the
-directories the formatter and linter walk — it is megabytes of generated Haskell,
-and hlint follows `#include` directives, so linting it costs orders of magnitude
-more memory than running the benchmarks does. Set `AIHC_CPP_BENCH_CORPUS` to
-point either layer at a directory of real-world modules instead.
+a few directives at the top. Set `AIHC_CPP_BENCH_CORPUS` to point it at a
+directory of real-world modules instead.
 
-Both benchmark binaries are built with an RTS heap cap (`-M512m`), so an
-oversized corpus fails with a heap-overflow message rather than exhausting the
-machine.
+The benchmark does not check that the three agree, and is not meant to.
+Preprocessing Haskell is under-specified — the implementations differ on comment
+handling, on rescanning, on what survives inside a literal — so demanding
+equivalence would mean either dropping the interesting inputs or holding
+aihc-cpp to another implementation's accidents. Behaviour is pinned down by the
+test suite, which compares against cpphs as an oracle; this measures speed. The
+output sizes printed before the timings are a sanity check that the three are
+doing comparable amounts of work, not a contract.
 
+There is deliberately no comparison against the C preprocessor GHC invokes.
+Running it means forking a process, and that dominates: on a 100KB input the
+fork and startup cost several times more than the preprocessing, so the
+measurement mostly reports how expensive it is to start a compiler driver.
+
+The corpus is written under `dist-newstyle/`, away from the directories the
+formatter and linter walk — it is megabytes of generated Haskell, and hlint
+follows `#include` directives, so linting it costs orders of magnitude more
+memory than running the benchmarks does. The benchmark binary carries an RTS
+heap cap (`-M512m`) so a corpus pointed somewhere unexpected fails with a
+heap-overflow message rather than exhausting the machine.
+
+[hpp]: https://hackage.haskell.org/package/hpp
 [cpphs]: https://hackage.haskell.org/package/cpphs
 
 ## Commands

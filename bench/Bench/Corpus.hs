@@ -6,17 +6,14 @@
 -- without churning the repository, and it is fully deterministic so that two
 -- runs on two machines benchmark byte-identical inputs.
 --
--- Every generated file is written to be acceptable to /both/ aihc-cpp and the
--- C preprocessor GHC invokes (@gcc -E -undef -traditional@), so that the two
--- can be compared on the same work. Constructs where the two intentionally
--- disagree are kept out of the corpus; the parity gate in @compare-ghc.sh@
--- fails loudly if that ever stops being true.
+-- The cases are chosen to isolate the different costs a preprocessor pays, so
+-- that a regression can be attributed to one of them rather than showing up as
+-- a single number that moved.
 module Bench.Corpus
   ( CorpusCase (..),
     corpusCases,
     generateCorpus,
     defaultCorpusRoot,
-    maxScale,
   )
 where
 
@@ -35,15 +32,6 @@ import System.FilePath ((</>))
 defaultCorpusRoot :: FilePath
 defaultCorpusRoot = "dist-newstyle" </> "bench-corpus"
 
--- | Largest accepted scale factor.
---
--- At the top of this range a case is a few tens of megabytes, which is already
--- far more than is needed to swamp process startup. The cap is here so that a
--- mistyped scale cannot fill the disk or push a benchmark past the heap limit
--- the binaries are built with.
-maxScale :: Int
-maxScale = 50
-
 -- | One benchmark input: a top-level file plus any files it includes.
 data CorpusCase = CorpusCase
   { -- | Short identifier, also the basename of the generated file.
@@ -52,23 +40,17 @@ data CorpusCase = CorpusCase
     caseDescription :: !String,
     -- | Path of the entry file, relative to the corpus root.
     caseEntry :: !FilePath,
-    -- | Whether GHC's C preprocessor is expected to produce equivalent output
-    -- for this case, and so whether it is fair to time the two against each
-    -- other on it. See 'literalsCase' for a case where it is not.
-    caseComparableWithGhc :: !Bool,
     -- | All files to write, relative to the corpus root.
     caseFiles :: [(FilePath, String)]
   }
 
--- | Rough target size, in lines, for each generated case, before scaling.
+-- | Rough target size, in lines, for each generated case.
 --
--- The scale factor exists because the two benchmark layers need different
--- input sizes to be honest. In-process, a few thousand lines is plenty. Run as
--- separate processes, spawning the binary costs more than preprocessing 100KB,
--- so the process-level comparison scales the corpus up until preprocessing
--- dominates the measurement instead of the operating system.
-baseCaseLines :: Int
-baseCaseLines = 4000
+-- Large enough that a single run takes milliseconds rather than microseconds,
+-- so the measurement is not dominated by timer resolution, and small enough
+-- that a full sweep of three preprocessors stays interactive.
+caseLines :: Int
+caseLines = 4000
 
 -- | The benchmark corpus.
 --
@@ -76,24 +58,21 @@ baseCaseLines = 4000
 -- real CPP-using Haskell looks like: a few directives at the top and thousands
 -- of lines the preprocessor merely has to copy. The remaining cases isolate
 -- individual costs so a regression can be attributed.
-corpusCases :: Int -> [CorpusCase]
-corpusCases scale =
-  [ passthroughCase n,
-    conditionalsCase n,
-    macrosCase n,
-    literalsCase n,
-    includesCase n
+corpusCases :: [CorpusCase]
+corpusCases =
+  [ passthroughCase,
+    conditionalsCase,
+    macrosCase,
+    literalsCase,
+    includesCase
   ]
-  where
-    n = baseCaseLines * max 1 scale
 
--- | Write the corpus under the given root directory, repeating the body of
--- each case @scale@ times.
-generateCorpus :: Int -> FilePath -> IO ()
-generateCorpus scale root = do
+-- | Write the corpus under the given root directory.
+generateCorpus :: FilePath -> IO ()
+generateCorpus root = do
   createDirectoryIfMissing True root
   createDirectoryIfMissing True (root </> "includes")
-  mapM_ writeCase (corpusCases scale)
+  mapM_ writeCase corpusCases
   where
     writeCase c = mapM_ writeOne (caseFiles c)
     writeOne (path, contents) = writeFile (root </> path) contents
@@ -122,16 +101,15 @@ pick seed xs = go seed
 
 -- | Ordinary Haskell with a realistic sprinkling of directives.
 --
--- Approximately 5% directive lines, matching what a survey of CPP-using
--- modules on Hackage looks like. This is the case that best predicts the cost
--- aihc-cpp adds to a real compile.
-passthroughCase :: Int -> CorpusCase
-passthroughCase caseLines =
+-- Roughly 5% directive lines, with the rest simply copied through. This is the
+-- case that best predicts the cost a preprocessor adds to a real compile, and
+-- the one to weight most heavily when reading the results.
+passthroughCase :: CorpusCase
+passthroughCase =
   CorpusCase
     { caseName = "passthrough",
       caseDescription = "realistic module: ~5% directives, the rest copied through",
       caseEntry = "passthrough.hs",
-      caseComparableWithGhc = True,
       caseFiles = [("passthrough.hs", body)]
     }
   where
@@ -171,13 +149,12 @@ passthroughCase caseLines =
         <> replicate 8 ("-- filler comment line for value " <> show i)
 
 -- | Dense, deeply nested conditionals with arithmetic and @defined@.
-conditionalsCase :: Int -> CorpusCase
-conditionalsCase caseLines =
+conditionalsCase :: CorpusCase
+conditionalsCase =
   CorpusCase
     { caseName = "conditionals",
       caseDescription = "nested #if/#elif/#else with arithmetic and defined()",
       caseEntry = "conditionals.hs",
-      caseComparableWithGhc = True,
       caseFiles = [("conditionals.hs", body)]
     }
   where
@@ -211,13 +188,12 @@ conditionalsCase caseLines =
       ]
 
 -- | Heavy object- and function-like macro expansion.
-macrosCase :: Int -> CorpusCase
-macrosCase caseLines =
+macrosCase :: CorpusCase
+macrosCase =
   CorpusCase
     { caseName = "macros",
       caseDescription = "object- and function-like macro expansion on every line",
       caseEntry = "macros.hs",
-      caseComparableWithGhc = True,
       caseFiles = [("macros.hs", body)]
     }
   where
@@ -243,20 +219,16 @@ macrosCase caseLines =
 
 -- | String, character and comment heavy input.
 --
--- This is where aihc-cpp does strictly more work than GHC's C preprocessor: it
--- is Haskell-aware and tracks Haskell block comments and string literals so it
--- can avoid expanding macros inside them, which GHC's C preprocessor happily
--- does. The outputs therefore differ by design, so this case is excluded from
--- the head-to-head comparison and only reported in-process. Keeping it as its
--- own case means the cost of that extra scanning is visible instead of quietly
--- taxing the average.
-literalsCase :: Int -> CorpusCase
-literalsCase caseLines =
+-- Haskell-aware preprocessors track Haskell block comments and string literals
+-- so they can avoid expanding macros inside them. That scanning is real work,
+-- and the three implementations do differing amounts of it, so it gets its own
+-- case rather than quietly taxing the average of the others.
+literalsCase :: CorpusCase
+literalsCase =
   CorpusCase
     { caseName = "literals",
       caseDescription = "string/char literals and Haskell comments (macro-suppression scanning)",
       caseEntry = "literals.hs",
-      caseComparableWithGhc = False,
       caseFiles = [("literals.hs", body)]
     }
   where
@@ -278,13 +250,12 @@ literalsCase caseLines =
       ]
 
 -- | An include chain, exercising the continuation-based include protocol.
-includesCase :: Int -> CorpusCase
-includesCase caseLines =
+includesCase :: CorpusCase
+includesCase =
   CorpusCase
     { caseName = "includes",
       caseDescription = "chain of #include files resolved through the continuation API",
       caseEntry = "includes.hs",
-      caseComparableWithGhc = True,
       caseFiles = ("includes.hs", entry) : map leaf [0 .. leafCount - 1]
     }
   where
