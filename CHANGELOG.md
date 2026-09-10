@@ -8,10 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Performance
 
-- Preprocessing the whole Stackage `lts-24.58` corpus is about 2.3x faster —
-  one sweep over 5,802 CPP-using modules went from 3.65 s to 1.59 s on the
+- Preprocessing the whole Stackage `lts-24.58` corpus is about 3.5x faster —
+  one sweep over 5,802 CPP-using modules went from 3.07 s to 0.87 s on the
   same machine, with byte-identical output and diagnostics for every module.
-  Four changes account for it:
+  Net of the file reads every tool pays for, that is 4.5x faster than `cpphs`,
+  against 1.12x before. The changes:
   - Macro expansion now scans byte offsets and copies nothing until a macro
     actually expands, so a line that names no macro is returned as the very
     `ByteString` that came in. Previously every line of every module was
@@ -26,6 +27,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     before scanning it for quote state, removing a full scan from every line;
     and a module that defines no function-like macro skips the multi-line
     call lookahead entirely.
+  - Splitting the input into lines uses `memchr` rather than a byte-at-a-time
+    walk that allocated a cursor per byte of the input.
+  - The line scanner works on byte offsets rather than a cursor per byte, and
+    a line that opens no comment — nearly every line — is recognised by a
+    loop over unboxed arguments and returned as a single span, skipping the
+    accumulator-threading scanner entirely.
+  - Loop-carried `where` bindings that only some branches use were thunks
+    allocated once per byte and once per identifier scanned; they are now
+    forced or pushed into the branch that needs them.
 
 ### Changed
 

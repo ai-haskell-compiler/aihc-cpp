@@ -31,6 +31,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BSB
 import qualified Data.ByteString.Char8 as C
 import qualified Data.ByteString.Lazy as BSL
+import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (isDigit)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
@@ -178,34 +179,54 @@ expandWith st painted txt0 =
     scan :: ByteString -> Int -> Int -> Bool -> Bool -> Bool -> BSB.Builder -> Bool -> (BSB.Builder, Bool)
     scan !buf !i !flushed !inString !inChar !escaped acc !changed
       | i >= len = (acc <> slice buf flushed len, changed)
-      | inString =
-          let escaped' = c == 0x5C && not escaped -- '\\'
-              inString' = escaped || c /= 0x22 -- '"'
-           in scan buf (i + 1) flushed inString' False escaped' acc changed
-      | inChar =
-          let escaped' = c == 0x5C && not escaped -- '\\'
-              inChar' = escaped || c /= 0x27 -- '\''
-           in scan buf (i + 1) flushed False inChar' escaped' acc changed
-      | startsHsComment buf i =
-          -- Copied through verbatim, so there is nothing to flush.
-          scan buf (hsCommentEnd buf i) flushed False False False acc changed
-      | c == 0x22 = scan buf (i + 1) flushed True False False acc changed -- '"'
-      | c == 0x27 = scan buf (i + 1) flushed False True False acc changed -- '\''
-      | isIdentStartByte c = expandIdent buf i flushed acc changed
-      | c == 0x2D && i + 1 < len && BS.index buf (i + 1) == 0x2D =
-          -- Haskell line comment: the rest of the text is not expanded.
-          (acc <> slice buf flushed len, changed)
-      | otherwise = scan buf (i + 1) flushed False False False acc changed
+      -- Matched against a 'case' rather than bound in a @where@: a
+      -- @where@ binding the end-of-input guard does not use is a thunk,
+      -- and this loop runs once per byte of the corpus.
+      | otherwise = case BS.index buf i of
+          c
+            | inString ->
+                let escaped' = c == 0x5C && not escaped -- '\\'
+                    inString' = escaped || c /= 0x22 -- '"'
+                 in scan buf (i + 1) flushed inString' False escaped' acc changed
+            | inChar ->
+                let escaped' = c == 0x5C && not escaped -- '\\'
+                    inChar' = escaped || c /= 0x27 -- '\''
+                 in scan buf (i + 1) flushed False inChar' escaped' acc changed
+            | c == 0x22 -> scan buf (i + 1) flushed True False False acc changed -- '"'
+            | c == 0x27 -> scan buf (i + 1) flushed False True False acc changed -- '\''
+            | isIdentStartByte c -> expandIdent buf i flushed acc changed
+            -- A block comment can only open on '{', so the three-byte test
+            -- is gated on that byte rather than run against every byte.
+            | c == 0x7B && startsHsComment buf len i ->
+                -- Copied through verbatim, so there is nothing to flush.
+                scan buf (hsCommentEnd buf i) flushed False False False acc changed
+            | c == 0x2D && i + 1 < len && BS.index buf (i + 1) == 0x2D ->
+                -- Haskell line comment: the rest is not expanded.
+                (acc <> slice buf flushed len, changed)
+            | otherwise ->
+                scan buf (skipDull buf len (i + 1)) flushed False False False acc changed
       where
         len = BS.length buf
-        c = BS.index buf i
 
     -- \| Handle the identifier starting at @i@.
+    --
+    -- Split in two so that the common case — an identifier that can name
+    -- no macro — allocates nothing. Everything the rare path needs
+    -- (@name@, the painted set, the continuations) would otherwise be a
+    -- thunk built once per identifier in the corpus.
     expandIdent :: ByteString -> Int -> Int -> BSB.Builder -> Bool -> (BSB.Builder, Bool)
     expandIdent !buf !i !flushed acc !changed
       -- No macro name starts with this byte: much the commonest outcome,
       -- and it costs one bit test rather than a walk of the macro map.
-      | not (bloomMember bloom (BS.index buf i)) = verbatim
+      | not (bloomMember bloom (BS.index buf i)) =
+          scan buf end flushed False False False acc changed
+      | otherwise = expandNamed buf i end (substr buf i end) flushed acc changed
+      where
+        !end = identEnd buf i
+
+    -- \| Handle an identifier whose first byte a macro name could share.
+    expandNamed :: ByteString -> Int -> Int -> ByteString -> Int -> BSB.Builder -> Bool -> (BSB.Builder, Bool)
+    expandNamed !buf !i !end !name !flushed acc !changed
       | S.member name painted = verbatim
       | name == "__LINE__" = replaceWith (BSB.string8 (show (stCurrentLine st)))
       | name == "__FILE__" = replaceWith (BSB.string8 (show (stCurrentFile st)))
@@ -238,8 +259,6 @@ expandWith st painted txt0 =
                 _ -> verbatim
             Nothing -> verbatim
       where
-        end = identEnd buf i
-        name = substr buf i end
         painted' = S.insert name painted
         verbatim = scan buf end flushed False False False acc changed
         replaceWith b =
@@ -250,18 +269,40 @@ identEnd :: ByteString -> Int -> Int
 identEnd buf = go
   where
     len = BS.length buf
+    -- The @i < len@ test guards the read on the same line: this is the
+    -- innermost loop of the scan and the bounds check doubled its cost.
     go !i
-      | i < len && isIdentByte (BS.index buf i) = go (i + 1)
+      | i < len && isIdentByte (BSU.unsafeIndex buf i) = go (i + 1)
       | otherwise = i
 
--- | Does a Haskell block comment open at @i@? @{-#@ is a pragma, not a
--- comment.
-startsHsComment :: ByteString -> Int -> Bool
-startsHsComment buf i =
-  i + 1 < BS.length buf
-    && BS.index buf i == 0x7B -- '{'
+-- | Advance past bytes that can neither start an identifier nor open a
+-- literal or a comment, so runs of whitespace, digits and punctuation are
+-- stepped over without re-entering the guard chain per byte.
+skipDull :: ByteString -> Int -> Int -> Int
+skipDull buf len = go
+  where
+    -- The @i < len@ test guards the read on the same line: this is the
+    -- innermost loop of the scan and the bounds check doubled its cost.
+    go !i
+      | i < len && isDullByte (BSU.unsafeIndex buf i) = go (i + 1)
+      | otherwise = i
+
+isDullByte :: Word8 -> Bool
+isDullByte b =
+  not (isIdentStartByte b)
+    && b /= 0x22 -- '"'
+    && b /= 0x27 -- '\''
+    && b /= 0x7B -- '{'
+    && b /= 0x2D -- '-'
+{-# INLINE isDullByte #-}
+
+-- | Given that @buf@ has @{@ at @i@, does a Haskell block comment open
+-- there? @{-#@ is a pragma, not a comment.
+startsHsComment :: ByteString -> Int -> Int -> Bool
+startsHsComment buf len i =
+  i + 1 < len
     && BS.index buf (i + 1) == 0x2D -- '-'
-    && (i + 2 >= BS.length buf || BS.index buf (i + 2) /= 0x23) -- '#'
+    && (i + 2 >= len || BS.index buf (i + 2) /= 0x23) -- '#'
 
 -- | The offset just past the Haskell block comment opening at @i@, or the
 -- end of the buffer if it is never closed.

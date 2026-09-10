@@ -39,13 +39,11 @@ import Aihc.Cpp.Cursor
     atEnd,
     findNewline,
     fromByteString,
-    lineSlice,
     peekByte,
     peekByteAt,
     skipNewline,
     skipWhile,
     sliceBytes,
-    toBytes,
   )
 import Aihc.Cpp.Evaluator (evalCondition)
 import Aihc.Cpp.Parser (Directive (..), isSpaceChar, parseDirective)
@@ -237,8 +235,8 @@ preprocess cfg input =
               }
 
 -- | Find the next line in the cursor, handling backslash-continuation
--- for directive lines. Returns (lineCursor, lineSpan, restCursor) where:
---   * lineCursor is a sub-cursor bounded to the logical line content
+-- for directive lines. Returns (lineText, lineSpan, restCursor) where:
+--   * lineText is the logical line content, without its newline
 --   * lineSpan is the number of physical lines consumed (>= 1)
 --   * restCursor is positioned after the line (past the newline)
 --
@@ -246,7 +244,7 @@ preprocess cfg input =
 -- (after optional whitespace), matching CPP semantics.
 -- For continuation lines, a new ByteString is allocated with the
 -- backslash-newline sequences removed.
-nextLine :: Cursor -> (Cursor, Int, Cursor)
+nextLine :: Cursor -> (ByteString, Int, Cursor)
 nextLine cur =
   let eol = findNewline cur
       lineStart = curPos cur
@@ -261,7 +259,7 @@ nextLine cur =
           let lineText = sliceBytes lineStart lineEnd cur
            in if hasGccStringContinuation emptyQuoteState lineText
                 then joinStringContinuationLines cur lineStart lineEnd rest
-                else (lineSlice lineEnd cur, 1, rest)
+                else (lineText, 1, rest)
 
 -- | Check if the bytes from curPos to lineEnd start with '#' after
 -- optional whitespace. This determines whether backslash-continuation
@@ -277,7 +275,7 @@ isDirectiveLine cur lineEnd =
 -- | Join backslash-continuation lines into a single logical line.
 -- Builds a new ByteString with '\<newline>' sequences removed.
 -- Returns (joinedCursor, physicalLineCount, restCursor).
-joinContinuationLines :: Cursor -> Int -> Int -> Cursor -> (Cursor, Int, Cursor)
+joinContinuationLines :: Cursor -> Int -> Int -> Cursor -> (ByteString, Int, Cursor)
 joinContinuationLines origCur lineStart firstLineEnd firstRest =
   let buf = curBuf origCur
       -- First segment: from lineStart to firstLineEnd - 1 (exclude '\')
@@ -288,7 +286,7 @@ joinContinuationLines origCur lineStart firstLineEnd firstRest =
       | atEnd rest =
           -- No more input; finalize
           let joined = BSL.toStrict (BSB.toLazyByteString acc)
-           in (fromByteString joined, spanCount, rest)
+           in (joined, spanCount, rest)
       | otherwise =
           let eol = findNewline rest
               segStart = curPos rest
@@ -304,7 +302,7 @@ joinContinuationLines origCur lineStart firstLineEnd firstRest =
                   -- Last line of continuation
                   let segment = BSB.byteString (sliceBS segStart segEnd (curBuf origCur))
                       joined = BSL.toStrict (BSB.toLazyByteString (acc <> segment))
-                   in (fromByteString joined, spanCount + 1, rest')
+                   in (joined, spanCount + 1, rest')
 
 -- | Slice a ByteString from position @start@ to @end@ (exclusive).
 sliceBS :: Int -> Int -> ByteString -> ByteString
@@ -334,7 +332,7 @@ hasGccStringContinuation :: QuoteState -> ByteString -> Bool
 hasGccStringContinuation st lineText =
   "\\\\" `C.isSuffixOf` lineText && qsInString (scanQuoteState st lineText)
 
-joinStringContinuationLines :: Cursor -> Int -> Int -> Cursor -> (Cursor, Int, Cursor)
+joinStringContinuationLines :: Cursor -> Int -> Int -> Cursor -> (ByteString, Int, Cursor)
 joinStringContinuationLines origCur lineStart firstLineEnd firstRest =
   let buf = curBuf origCur
       firstSegment = sliceBytes lineStart (firstLineEnd - 1) origCur
@@ -344,7 +342,7 @@ joinStringContinuationLines origCur lineStart firstLineEnd firstRest =
     go !acc !spanCount !rest !quoteState
       | atEnd rest =
           let joined = BSL.toStrict (BSB.toLazyByteString acc)
-           in (fromByteString joined, spanCount, rest)
+           in (joined, spanCount, rest)
       | otherwise =
           let eol = findNewline rest
               segStart = curPos rest
@@ -359,7 +357,7 @@ joinStringContinuationLines origCur lineStart firstLineEnd firstRest =
                 else
                   let segmentBytes = BSB.byteString (sliceBS segStart segEnd (curBuf origCur))
                       joined = BSL.toStrict (BSB.toLazyByteString (acc <> segmentBytes))
-                   in (fromByteString joined, spanCount + 1, rest')
+                   in (joined, spanCount + 1, rest')
 
 scanQuoteState :: QuoteState -> ByteString -> QuoteState
 scanQuoteState = go
@@ -406,13 +404,12 @@ processFile _ cursor trailingNl _ _ st k
           k (emitBlankLines 1 st)
         else k st
 processFile filePath cursor trailingNl stack !lineNo st k =
-  let (lineCur, lineSpan, restCursor) = nextLine cursor
+  let (lineText, lineSpan, restCursor) = nextLine cursor
       -- Detect if this line was followed by a newline (vs EOF).
       -- If so and restCursor is at EOF, the file had a trailing newline.
       hasTrailingNl = trailingNl && not (atEnd restCursor) || (trailingNl && atEnd restCursor)
       -- Actually: trailingNl flag is set at processFile entry for includes.
       -- We just propagate it. The check at atEnd above handles the final empty line.
-      lineText = toBytes lineCur
       startsInBlockComment = stHsBlockCommentDepth st > 0 || stCBlockCommentDepth st > 0
       parsedDirective =
         if startsInBlockComment
@@ -423,7 +420,7 @@ processFile filePath cursor trailingNl stack !lineNo st k =
    in if not isActive && not (stSkippingDanglingElse st)
         then -- === Fast path for inactive branches ===
         -- Only track comment depth; skip full span scanning and macro expansion.
-          let (finalHs, finalC) = scanLineDepthOnly (stHsBlockCommentDepth st) (stCBlockCommentDepth st) lineCur
+          let (finalHs, finalC) = scanLineDepthOnly (stHsBlockCommentDepth st) (stCBlockCommentDepth st) lineText
               advanceSt st' =
                 st'
                   { stCurrentLine = nextLineNo,
@@ -450,7 +447,7 @@ processFile filePath cursor trailingNl stack !lineNo st k =
                           }
                    in handleDirective ctx st directive
         else -- === Normal path: full scan + expansion ===
-          let lineScan = scanLine (stHsBlockCommentDepth st) (stCBlockCommentDepth st) lineCur
+          let lineScan = scanLine (stHsBlockCommentDepth st) (stCBlockCommentDepth st) lineText
               advanceLineState st' =
                 st'
                   { stCurrentLine = nextLineNo,
@@ -522,8 +519,8 @@ scanConsumedLines !hsDepth !cDepth cur remaining
   | atEnd cur = (hsDepth, cDepth)
   | otherwise =
       let eol = findNewline cur
-          lineCur = lineSlice (curPos eol) cur
-          (hsDepth', cDepth') = scanLineDepthOnly hsDepth cDepth lineCur
+          lineText = sliceBytes (curPos cur) (curPos eol) cur
+          (hsDepth', cDepth') = scanLineDepthOnly hsDepth cDepth lineText
           rest = fromMaybe eol (skipNewline eol)
        in scanConsumedLines hsDepth' cDepth' rest (remaining - 1)
 

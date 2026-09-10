@@ -52,16 +52,21 @@ passes:
 
 | tool | ok | errored | crashed | seconds | MiB out | MiB/s |
 | --- | --- | --- | --- | --- | --- | --- |
-| aihc-cpp | 5734 | 68 | **0** | 1.62 | 71.4 | 44.2 |
-| cpphs | 5773 | 0 | 29 | 4.74 | 71.0 | 15.2 |
-| hpp | 5575 | 0 | 227 | 39.92 | 64.6 | 1.8 |
-| *(read only)* | 5802 | — | — | *0.12* | — | — |
-| *(read + String)* | 5802 | — | — | *0.73* | — | — |
+| aihc-cpp | 5734 | 68 | **0** | 0.87 | 71.4 | 82.8 |
+| cpphs | 5773 | 0 | 29 | 4.07 | 71.0 | 17.6 |
+| hpp | 5575 | 0 | 227 | 33.13 | 64.6 | 2.2 |
+| *(read only)* | 5802 | — | — | *0.11* | — | — |
+| *(read + String)* | 5802 | — | — | *0.63* | — | — |
 
-Subtract each tool's input baseline for a like-for-like figure: aihc-cpp 1.50 s
-against cpphs 4.01 s, so **aihc-cpp is about 2.7x faster**, and hpp is an order
+Subtract each tool's input baseline for a like-for-like figure: aihc-cpp 0.76 s
+against cpphs 3.44 s, so **aihc-cpp is about 4.5x faster**, and hpp is an order
 of magnitude behind both. aihc-cpp is the only one that gets through all 5,802
 modules without crashing.
+
+Take the seconds column for what it is. These are medians of three passes on
+one unloaded machine; the same binary measured 5x slower on the same machine
+with something else running, and only the ratio between two tools measured in
+the same pass held steady. The counts either side of it do not move at all.
 
 The three columns are not interchangeable:
 
