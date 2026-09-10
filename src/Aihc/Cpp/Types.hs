@@ -14,6 +14,11 @@ module Aihc.Cpp.Types
     Step (..),
     EngineState (..),
     emptyState,
+    defineMacro,
+    undefMacro,
+    setMacroTable,
+    macroFirstByte,
+    bloomMember,
     CondFrame (..),
     currentActive,
     mkFrame,
@@ -24,13 +29,16 @@ where
 
 import Aihc.Cpp.Cursor (Cursor)
 import Control.DeepSeq (NFData)
+import Data.Bits (setBit, testBit, (.&.))
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BSB
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import Data.Set (Set)
 import qualified Data.Set as S
 import Data.Text (Text)
+import Data.Word (Word64, Word8)
 import GHC.Generics (Generic)
 
 -- $setup
@@ -149,6 +157,17 @@ data Step
 
 data EngineState = EngineState
   { stMacros :: !(Map ByteString MacroDef),
+    -- | Which bytes any macro name can start with, as a 64-bit set (see
+    -- 'macroFirstByte'). Nearly every identifier in a Haskell module names
+    -- no macro, and testing one bit rejects it without the string
+    -- comparisons a 'Map' lookup would run. Kept in step with 'stMacros'
+    -- by 'setMacros'; @_@ is always a member, because @__LINE__@ and
+    -- @__FILE__@ are recognised without being in the map.
+    stMacroBloom :: {-# UNPACK #-} !Word64,
+    -- | The same, restricted to function-like macros, and 0 when a module
+    -- defines none — which is the common case, and lets the multi-line
+    -- call lookahead skip the line entirely.
+    stFunMacroBloom :: {-# UNPACK #-} !Word64,
     stOutput :: !BSB.Builder,
     stOutputLineCount :: {-# UNPACK #-} !Int,
     stDiagnosticsRev :: ![Diagnostic],
@@ -164,6 +183,8 @@ emptyState :: FilePath -> EngineState
 emptyState filePath =
   EngineState
     { stMacros = M.empty,
+      stMacroBloom = underscoreBloom,
+      stFunMacroBloom = 0,
       stOutput = mempty,
       stOutputLineCount = 0,
       stDiagnosticsRev = [],
@@ -174,6 +195,63 @@ emptyState filePath =
       stCurrentFile = filePath,
       stCurrentLine = 1
     }
+
+-- | Define a macro, keeping the first-byte blooms in step. Adding a name
+-- only ever sets bits, so this costs one @Map@ insert rather than a walk
+-- of the whole table.
+defineMacro :: ByteString -> MacroDef -> EngineState -> EngineState
+defineMacro name def st =
+  st
+    { stMacros = M.insert name def (stMacros st),
+      stMacroBloom = setBit (stMacroBloom st) bit',
+      stFunMacroBloom = case def of
+        FunctionMacro _ _ -> setBit (stFunMacroBloom st) bit'
+        ObjectMacro _ -> stFunMacroBloom st
+    }
+  where
+    bit' = macroFirstByte name
+
+-- | Undefine a macro. Removing a name can clear a bit, which only a full
+-- pass can tell, so the blooms are rebuilt; @#undef@ is rare enough for
+-- that not to matter.
+undefMacro :: ByteString -> EngineState -> EngineState
+undefMacro name st = setMacroTable (M.delete name (stMacros st)) st
+
+-- | Replace the macro table wholesale and rebuild the blooms from it.
+setMacroTable :: Map ByteString MacroDef -> EngineState -> EngineState
+setMacroTable macros st =
+  let (allBloom, funBloom) = M.foldrWithKey step (underscoreBloom, 0) macros
+   in st
+        { stMacros = macros,
+          stMacroBloom = allBloom,
+          stFunMacroBloom = funBloom
+        }
+  where
+    step name def (allBloom, funBloom) =
+      let bit' = macroFirstByte name
+          allBloom' = setBit allBloom bit'
+       in case def of
+            FunctionMacro _ _ -> (allBloom', setBit funBloom bit')
+            ObjectMacro _ -> (allBloom', funBloom)
+
+-- | Bloom containing only @_@, the first byte of @__LINE__@ and @__FILE__@.
+underscoreBloom :: Word64
+underscoreBloom = setBit 0 (macroFirstByte "_")
+
+-- | Which bit of a bloom a name's first byte occupies: the low six bits of
+-- that byte. Identifiers start with a letter, @_@, or a byte >= 0x80, and
+-- those map to distinct bits across @A-Z@, @a-z@ and @_@, so the filter is
+-- exact for ASCII names and merely approximate for the rest.
+macroFirstByte :: ByteString -> Int
+macroFirstByte name
+  | BS.null name = 0
+  | otherwise = fromIntegral (BS.head name .&. 0x3F)
+{-# INLINE macroFirstByte #-}
+
+-- | Could a name starting with this byte be in the bloom?
+bloomMember :: Word64 -> Word8 -> Bool
+bloomMember bloom b = testBit bloom (fromIntegral (b .&. 0x3F))
+{-# INLINE bloomMember #-}
 
 data CondFrame = CondFrame
   { frameOuterActive :: !Bool,

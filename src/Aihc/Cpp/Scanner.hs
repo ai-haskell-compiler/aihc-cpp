@@ -67,16 +67,23 @@ expandLineBySpanMultiline st spans futureCursor =
         _ -> not hasCBlockComment
    in if hasLineComment || hasHsComment
         then -- Haskell comments stay in the token stream, so expand the full line.
-          let fullText = C.concat [lineSpanText s | s <- spans]
+          let fullText = concatSpans spans
            in (expandMacros st fullText, 0)
         else
           if hasCBlockComment
             then -- C comments are stripped to spaces, so preserve per-span handling.
               (expandLineBySpan st spans, 0)
             else -- Pure code line: try multi-line expansion
-              let codeText = C.concat [lineSpanText s | s <- spans]
+              let codeText = concatSpans spans
                   futureCodeLines = cursorToLines futureCursor
                in expandMacrosMultiline st codeText futureCodeLines
+
+-- | Join the text of a line's spans. A line with no comment on it is a
+-- single span, and returning that slice unchanged keeps the common case
+-- zero-copy; 'C.concat' would copy it.
+concatSpans :: [LineSpan] -> ByteString
+concatSpans [one] = lineSpanText one
+concatSpans spans = C.concat (map lineSpanText spans)
 
 -- | Extract lines from a cursor as a lazy list of byte slices.
 -- Each line is the content up to the next newline (or EOF).

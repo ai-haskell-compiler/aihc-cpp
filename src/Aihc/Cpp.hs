@@ -65,15 +65,17 @@ import Aihc.Cpp.Types
     Step (..),
     currentActive,
     defaultConfig,
+    defineMacro,
     emptyState,
     mkFrame,
+    setMacroTable,
+    undefMacro,
   )
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BSB
 import qualified Data.ByteString.Char8 as C
 import qualified Data.ByteString.Lazy as BSL
-import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as S
@@ -220,9 +222,7 @@ preprocess cfg input =
   where
     initialState =
       let st0 = emitLine (linePragma 1 (configInputFile cfg)) (emptyState (configInputFile cfg))
-       in st0
-            { stMacros = M.map ObjectMacro (configMacros cfg)
-            }
+       in setMacroTable (M.map ObjectMacro (configMacros cfg)) st0
 
     finish st =
       let out = BSL.toStrict (BSB.toLazyByteString (stOutput st))
@@ -326,9 +326,13 @@ emptyQuoteState = QuoteState False False False
 -- final backslash is the CPP continuation marker.  GHC's default CPP-like
 -- handling also accepts the single-backslash spelling, so only the double
 -- spelling is spliced here.
+--
+-- The cheap suffix test comes first: 'scanQuoteState' walks the whole line,
+-- and almost no line in real source ends in a double backslash, so testing
+-- the two trailing bytes first removes a full scan from every line.
 hasGccStringContinuation :: QuoteState -> ByteString -> Bool
 hasGccStringContinuation st lineText =
-  qsInString (scanQuoteState st lineText) && "\\\\" `C.isSuffixOf` lineText
+  "\\\\" `C.isSuffixOf` lineText && qsInString (scanQuoteState st lineText)
 
 joinStringContinuationLines :: Cursor -> Int -> Int -> Cursor -> (Cursor, Int, Cursor)
 joinStringContinuationLines origCur lineStart firstLineEnd firstRest =
@@ -545,11 +549,11 @@ handleDirective :: LineContext -> EngineState -> Directive -> Step
 handleDirective ctx st directive =
   case directive of
     DirDefineObject name value ->
-      mutateMacrosWhenActive ctx st (M.insert name (ObjectMacro value))
+      mutateMacrosWhenActive ctx st (defineMacro name (ObjectMacro value))
     DirDefineFunction name params body ->
-      mutateMacrosWhenActive ctx st (M.insert name (FunctionMacro params body))
+      mutateMacrosWhenActive ctx st (defineMacro name (FunctionMacro params body))
     DirUndef name ->
-      mutateMacrosWhenActive ctx st (M.delete name)
+      mutateMacrosWhenActive ctx st (undefMacro name)
     DirInclude kind includeTarget ->
       handleIncludeDirective ctx st kind includeTarget
     DirIf expr ->
@@ -595,10 +599,10 @@ continueBlank ctx st = lcContinue ctx (emitDirectiveBlank ctx st)
 continueBlankWithStack :: LineContext -> [CondFrame] -> EngineState -> Step
 continueBlankWithStack ctx stack st = lcContinueWith ctx stack (emitDirectiveBlank ctx st)
 
-mutateMacrosWhenActive :: LineContext -> EngineState -> (Map ByteString MacroDef -> Map ByteString MacroDef) -> Step
+mutateMacrosWhenActive :: LineContext -> EngineState -> (EngineState -> EngineState) -> Step
 mutateMacrosWhenActive ctx st mutate =
   if currentActive (lcStack ctx)
-    then continueBlank ctx (st {stMacros = mutate (stMacros st)})
+    then continueBlank ctx (mutate st)
     else continueBlank ctx st
 
 addDiagnosticWhenActive :: LineContext -> Severity -> Text -> EngineState -> Step

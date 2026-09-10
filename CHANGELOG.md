@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Performance
+
+- Preprocessing the whole Stackage `lts-24.58` corpus is about 2.3x faster —
+  one sweep over 5,802 CPP-using modules went from 3.65 s to 1.59 s on the
+  same machine, with byte-identical output and diagnostics for every module.
+  Four changes account for it:
+  - Macro expansion now scans byte offsets and copies nothing until a macro
+    actually expands, so a line that names no macro is returned as the very
+    `ByteString` that came in. Previously every line of every module was
+    rebuilt one character at a time through a `Builder`.
+  - A 64-bit first-byte filter over the macro names rejects an identifier
+    that can name no macro without walking the macro map, which is the
+    outcome for nearly every identifier in a Haskell module.
+  - Token pasting in a function-like macro body no longer appends to the end
+    of a list once per token, which was quadratic in the body length and the
+    single largest source of allocation.
+  - The GCC string-continuation check tests the two trailing bytes of a line
+    before scanning it for quote state, removing a full scan from every line;
+    and a module that defines no function-like macro skips the multi-line
+    call lookahead entirely.
+
 ### Changed
 
 - **Breaking:** the preprocessor is now agnostic to the source encoding.
