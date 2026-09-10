@@ -46,21 +46,27 @@ package sources from a pinned Stackage snapshot (`lts-24.58`, GHC 9.10.3) into
 just bench-stackage-sweep
 ```
 
-One pass over every CPP-using module in the snapshot — all 3,441 packages, 5,802
-modules, 71 MiB of source. On an M-series Mac with GHC 9.12.4:
+One pass over every CPP-using module in the snapshot — all 3,404 packages, 5,802
+modules, 71 MiB of source. On an M-series Mac with GHC 9.12.4, medians of three
+passes:
 
 | tool | ok | errored | crashed | seconds | MiB out | MiB/s |
 | --- | --- | --- | --- | --- | --- | --- |
-| aihc-cpp | 5551 | 251 | **0** | 3.19 | 69.8 | 22.5 |
-| cpphs | 5772 | 0 | 30 | 4.13 | 69.4 | 17.4 |
-| hpp | 5409 | 0 | 393 | 33.70 | 60.6 | 2.1 |
-| *(read only)* | 5802 | — | — | *0.14* | — | — |
-| *(read + String)* | 5802 | — | — | *0.71* | — | — |
+| aihc-cpp | 5734 | 68 | **0** | 0.87 | 71.4 | 82.8 |
+| cpphs | 5773 | 0 | 29 | 4.07 | 71.0 | 17.6 |
+| hpp | 5575 | 0 | 227 | 33.13 | 64.6 | 2.2 |
+| *(read only)* | 5802 | — | — | *0.11* | — | — |
+| *(read + String)* | 5802 | — | — | *0.63* | — | — |
 
-Subtract each tool's input baseline for a like-for-like figure: aihc-cpp 3.05 s
-against cpphs 3.42 s, so **aihc-cpp is about 1.12x faster**, and hpp is an order
+Subtract each tool's input baseline for a like-for-like figure: aihc-cpp 0.76 s
+against cpphs 3.44 s, so **aihc-cpp is about 4.5x faster**, and hpp is an order
 of magnitude behind both. aihc-cpp is the only one that gets through all 5,802
 modules without crashing.
+
+Take the seconds column for what it is. These are medians of three passes on
+one unloaded machine; the same binary measured 5x slower on the same machine
+with something else running, and only the ratio between two tools measured in
+the same pass held steady. The counts either side of it do not move at all.
 
 The three columns are not interchangeable:
 
@@ -102,18 +108,18 @@ tree does not:
 - `cabal_macros.h`, which is **empty on purpose**. Cabal generates one per
   package during a build; this exists only so the include resolves.
 
-Together these took aihc-cpp's error count from 443 to 251 and hpp's crashes
-from 569 to 393.
+Together these took aihc-cpp's error count from 195 to 68, hpp's crashes from
+344 to 227, and cpphs's from 47 to 29.
 
 The empty `cabal_macros.h` is worth a note, because the obvious richer version
-was measured and discarded. A generated file carrying `MIN_VERSION_` for all
-3,441 snapshot packages produced *identical* counts — 251, 393 and 30 — because
-resolving the include is nearly all of the benefit: an undefined macro in an
-`#if` takes the other branch rather than failing. Nor can a shared file be
-pre-included the way Cabal pre-includes the real one with `-optP-include`: even
-pruned to the 256 packages the corpus names it is 212 KB against an average
-module of 12 KB, which turns a 71 MiB corpus into 1.3 GiB and takes aihc-cpp
-from 3.26 s to 69.56 s, for two more modules resolved. A real per-package
+was measured and discarded. A generated file carrying `MIN_VERSION_` for every
+snapshot package produced *identical* counts, because resolving the include is
+nearly all of the benefit: an undefined macro in an `#if` takes the other branch
+rather than failing. Nor can a shared file be pre-included the way Cabal
+pre-includes the real one with `-optP-include`: even pruned to the 256 packages
+the corpus names it is 212 KB against an average module of 12 KB, which turns a
+71 MiB corpus into 1.3 GiB and multiplies aihc-cpp's sweep time by about twenty,
+for two more modules resolved. A real per-package
 `cabal_macros.h` is small because it holds only that package's dependencies; a
 shared one cannot be.
 

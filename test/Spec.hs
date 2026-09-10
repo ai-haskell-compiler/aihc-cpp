@@ -23,6 +23,7 @@ main = do
         ( checks
             <> [linePragmaTest, dateTimeTest, functionMacroArgumentTest, functionMacroUnclosedCallTest, definedConditionSpacingTest, stringContinuationTests, tokenPastingTests, ccallLineCommentTest]
             <> [pragmaOnceTest, macroRescanTests, pragmaInsideBlockCommentTests, encodingTests]
+            <> [lineSpanTests]
             <> [QC.testProperty "dummy quickcheck property" prop_dummy]
         )
     )
@@ -103,6 +104,76 @@ diagnosticsOf cfg input =
   case preprocess cfg input of
     Done result -> resultDiagnostics result
     _ -> error "expected Done"
+
+-- | Where a line splits into code and comment spans.
+--
+-- The line scanner has a fast path for a line that is one code span, and
+-- it decides that with the same string- and char-literal state machine
+-- the general scanner uses. A line that only looks like it opens a
+-- comment must not take the fast path, and one that only looks like it
+-- does not must not miss it: whether a span is code or comment decides
+-- whether macros in it expand, so a disagreement is silent.
+lineSpanTests :: TestTree
+lineSpanTests =
+  testGroup
+    "line spans"
+    [ expands "{- inside a string opens no comment" "x = \"a {- b\" ++ FOO\n" "x = \"a {- b\" ++ 1\n",
+      expands "a brace in a char literal opens no comment" "c = '{'\n" "c = '{'\n",
+      expands "-- inside a string starts no line comment" "x = \"a -- b\" ++ FOO\n" "x = \"a -- b\" ++ 1\n",
+      expands "/* inside a string starts no C comment" "x = \"/*\" ++ FOO\n" "x = \"/*\" ++ 1\n",
+      expands "a {-# pragma is not a comment" "{-# LANGUAGE CPP #-}\n" "{-# LANGUAGE CPP #-}\n",
+      expands "a closed string leaves literal state" "x = \"a\\\\\\\\\" ++ FOO\n" "x = \"a\\\\\\\\\" ++ 1\n",
+      -- The remaining three are the cases the fast path must decline.
+      expands
+        "a macro inside an inline block comment does not expand"
+        "x = 1 {- FOO -} + FOO\n"
+        "x = 1 {- FOO -} + 1\n",
+      expands
+        "a macro after a line comment marker does not expand"
+        "x = 1 -- FOO\n"
+        "x = 1 -- FOO\n",
+      expands
+        "a C block comment becomes spaces of the same width"
+        "x = 1 /* FOO */ + FOO\n"
+        "x = 1           + 1\n",
+      -- A prime is lexed as an unterminated char literal, so the rest of
+      -- the line is inside a literal and nothing in it expands. That is
+      -- long-standing behaviour, pinned here because the fast path has to
+      -- reproduce it to agree with the general scanner.
+      expands "an unterminated char literal suppresses expansion" "x' = FOO\n" "x' = FOO\n",
+      -- The three below are the cases where getting the literal state
+      -- wrong changes the output rather than merely costing a fast path.
+      -- A C comment is replaced by spaces, so which lines are inside one
+      -- is visible; a Haskell comment is not, which is why these use /*.
+      expands
+        "a string closes before a C comment opens"
+        "x = \"a\" /* FOO\nFOO\n*/\ny = FOO\n"
+        "x = \"a\"       \n   \n  \ny = 1\n",
+      expands
+        "a char literal closes before a C comment opens"
+        "c = 'x' /* FOO\nFOO\n*/\ny = FOO\n"
+        "c = 'x'       \n   \n  \ny = 1\n",
+      -- A line whose last byte is the first half of a two-byte sequence
+      -- must not make the scanner look past the end of it. 'preprocess'
+      -- promises never to raise, so an out-of-range read here would be a
+      -- broken contract rather than a wrong answer.
+      expands "a line ending in a lone -" "x = 1 -\nFOO\n" "x = 1 -\n1\n",
+      expands "a line ending in a lone {" "x = {\nFOO\n" "x = {\n1\n",
+      expands "a line ending in a lone /" "x = /\nFOO\n" "x = /\n1\n",
+      expands "a line ending in a lone *" "x = 1 *\nFOO\n" "x = 1 *\n1\n",
+      expands "a line that is a lone -" "-\n" "-\n",
+      expands "a line that is a lone {" "{\n" "{\n",
+      -- A function-like call opened inside a line comment is not a call,
+      -- so the following line must not be swallowed as its continuation.
+      testCase "a line comment ends the multi-line call lookahead" $
+        preprocessTo defaultConfig "#define F(a) a\nx = 1 -- F(\n  2)\ny = F(3)\n"
+          @?= "#line 1 \"<input>\"\n\nx = 1 -- F(\n  2)\ny = 3\n"
+    ]
+  where
+    expands name body expected =
+      testCase name $
+        preprocessTo defaultConfig ("#define FOO 1\n" <> body)
+          @?= ("#line 1 \"<input>\"\n\n" <> expected)
 
 -- | Dummy QuickCheck property that always passes.
 -- Added so that --quickcheck-tests flag is accepted by the test suite.

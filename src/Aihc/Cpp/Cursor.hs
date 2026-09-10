@@ -160,14 +160,14 @@ skipToInteresting = go
 -- positioned at the newline (or at EOF). The bytes from the
 -- original position to the returned position form the line content
 -- (without the newline).
+-- 'BS.elemIndex' is a @memchr@, which searches many bytes at a time; the
+-- byte-at-a-time loop this replaces also allocated a fresh 'Cursor' per
+-- byte of every line in the input.
 findNewline :: Cursor -> Cursor
-findNewline = go
-  where
-    go !cur = case peekByte cur of
-      Nothing -> cur
-      Just 0x0A -> cur -- '\n'
-      Just _ -> go (advance cur)
-{-# INLINE findNewline #-}
+findNewline (Cursor buf pos) =
+  case BS.elemIndex 0x0A (BS.drop pos buf) of -- '\n'
+    Just offset -> Cursor buf (pos + offset)
+    Nothing -> Cursor buf (BS.length buf)
 
 -- | Advance past a newline byte if the cursor is currently on one.
 -- Returns 'Nothing' at EOF, 'Just cursor' after the newline otherwise.

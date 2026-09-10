@@ -24,25 +24,26 @@ module Aihc.Cpp.Evaluator
 where
 
 import Aihc.Cpp.Parser (isIdentChar, isIdentStart, isOpChar, isSpaceChar)
-import Aihc.Cpp.Types (EngineState (..), MacroDef (..))
+import Aihc.Cpp.Types (EngineState (..), MacroDef (..), bloomMember)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Builder as BSB
 import qualified Data.ByteString.Char8 as C
 import qualified Data.ByteString.Lazy as BSL
+import qualified Data.ByteString.Unsafe as BSU
 import Data.Char (isDigit)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as M
 import Data.Set (Set)
 import qualified Data.Set as S
+import Data.Word (Word8)
 
 -- | Expand macros in a single piece of text using the blue-paint algorithm.
 -- A single pass with a suppression set replaces the previous iterate-up-to-32
 -- fixpoint approach.
 expandMacros :: EngineState -> ByteString -> ByteString
-expandMacros st txt =
-  builderToBytes (expandBlue st S.empty False False False (BSB.byteString txt))
+expandMacros st = expandWith st S.empty
 
 -- | Expand macros with multi-line support. When a function-like macro call
 -- spans multiple lines, continuation lines are consumed from @moreLines@.
@@ -62,9 +63,15 @@ expandMacrosMultiline st txt moreLines =
 -- Scans the first line for an identifier that matches a function macro,
 -- then checks if parseCallArgs needs to span into continuation lines.
 countExtraLinesConsumed :: EngineState -> ByteString -> [ByteString] -> Int
-countExtraLinesConsumed st txt moreLines = scanForFunctionMacro False False False txt
+countExtraLinesConsumed st txt moreLines
+  -- A module that defines no function-like macro cannot have a call
+  -- spanning lines, and most do not; skipping the scan saves a second
+  -- walk over every line of the file.
+  | funBloom == 0 = 0
+  | otherwise = scanForFunctionMacro False False False txt
   where
     macros = stMacros st
+    funBloom = stFunMacroBloom st
 
     scanForFunctionMacro :: Bool -> Bool -> Bool -> ByteString -> Int
     scanForFunctionMacro _ _ _ t | C.null t = 0
@@ -87,12 +94,14 @@ countExtraLinesConsumed st txt moreLines = scanForFunctionMacro False False Fals
           | c == '\'' -> scanForFunctionMacro False True False rest
           | isIdentStart c ->
               let (ident, rest') = C.span isIdentChar t
-               in case M.lookup ident macros of
-                    Just (FunctionMacro _ _) ->
-                      case tryMultilineCallArgs rest' of
-                        Just n -> n
-                        Nothing -> scanForFunctionMacro False False False rest'
-                    _ -> scanForFunctionMacro False False False rest'
+               in if not (bloomMember funBloom (BS.head ident))
+                    then scanForFunctionMacro False False False rest'
+                    else case M.lookup ident macros of
+                      Just (FunctionMacro _ _) ->
+                        case tryMultilineCallArgs rest' of
+                          Just n -> n
+                          Nothing -> scanForFunctionMacro False False False rest'
+                      _ -> scanForFunctionMacro False False False rest'
           | otherwise -> scanForFunctionMacro False False False rest
 
     -- Try to parse function call args, potentially spanning multiple lines.
@@ -144,82 +153,198 @@ countExtraLinesConsumed st txt moreLines = scanForFunctionMacro False False Fals
               | ch == ')' -> Just extraLines
               | otherwise -> goClosing False False False depth rest extraLines
 
--- | Blue-paint macro expansion engine. Uses a suppression set (@painted@)
--- to prevent infinite recursion instead of iterating to a fixpoint.
--- Output is accumulated via a lazy 'BSB.Builder' for amortized O(n).
-expandBlue :: EngineState -> Set ByteString -> Bool -> Bool -> Bool -> BSB.Builder -> BSB.Builder
-expandBlue st painted inString inChar escaped input =
-  let txt = builderToBytes input
-   in goText st painted inString inChar escaped txt mempty
+-- | Blue-paint macro expansion: expand @txt@, leaving any name in
+-- @painted@ alone so that a macro cannot re-enter itself. A single pass
+-- with a suppression set replaces the previous iterate-up-to-32 fixpoint
+-- approach.
+--
+-- The scan walks byte offsets and copies nothing until a macro actually
+-- expands, so text that names no macro comes back as the very
+-- 'ByteString' that went in. That is the case that matters: this runs on
+-- every line of every module, and almost no line expands anything.
+expandWith :: EngineState -> Set ByteString -> ByteString -> ByteString
+expandWith st painted txt0 =
+  case scan txt0 0 0 False False False mempty False of
+    (_, False) -> txt0
+    (acc, True) -> builderToBytes acc
+  where
+    macros = stMacros st
+    bloom = stMacroBloom st
 
--- | Walk the input text, expanding macros with blue-paint suppression.
-goText :: EngineState -> Set ByteString -> Bool -> Bool -> Bool -> ByteString -> BSB.Builder -> BSB.Builder
-goText _ _ _ _ _ txt acc | C.null txt = acc
-goText st painted inString inChar escaped txt acc =
-  case C.uncons txt of
-    Nothing -> acc
-    Just (c, rest)
-      | inString ->
-          let escaped' = c == '\\' && not escaped
-              inString' = not (c == '"' && not escaped)
-           in goText st painted inString' False escaped' rest (acc <> BSB.char8 c)
-      | inChar ->
-          let escaped' = c == '\\' && not escaped
-              inChar' = not (c == '\'' && not escaped)
-           in goText st painted False inChar' escaped' rest (acc <> BSB.char8 c)
-      | startsHsBlockComment txt ->
-          let (commentText, remaining) = consumeHsBlockComment txt
-           in goText st painted False False False remaining (acc <> BSB.byteString commentText)
-      | c == '"' ->
-          goText st painted True False False rest (acc <> BSB.char8 c)
-      | c == '\'' ->
-          goText st painted False True False rest (acc <> BSB.char8 c)
-      | isIdentStart c ->
-          expandIdentBlue st painted txt acc
-      | c == '-',
-        Just ('-', _) <- C.uncons rest ->
-          -- Haskell line comment: copy remainder verbatim without macro expansion
-          acc <> BSB.byteString txt
-      | otherwise ->
-          goText st painted False False False rest (acc <> BSB.char8 c)
+    -- \| @scan buf i flushed inString inChar escaped acc changed@ walks
+    -- @buf@ from offset @i@; everything before @flushed@ is already in
+    -- @acc@. An expansion may continue in a different buffer (a
+    -- function-like call whose argument list held a line comment is
+    -- rewritten), so the buffer travels with the loop.
+    scan :: ByteString -> Int -> Int -> Bool -> Bool -> Bool -> BSB.Builder -> Bool -> (BSB.Builder, Bool)
+    scan !buf !i !flushed !inString !inChar !escaped acc !changed
+      | i >= len = (acc <> slice buf flushed len, changed)
+      -- Matched against a 'case' rather than bound in a @where@: a
+      -- @where@ binding the end-of-input guard does not use is a thunk,
+      -- and this loop runs once per byte of the corpus.
+      | otherwise = case BS.index buf i of
+          c
+            | inString ->
+                let escaped' = c == 0x5C && not escaped -- '\\'
+                    inString' = escaped || c /= 0x22 -- '"'
+                 in scan buf (i + 1) flushed inString' False escaped' acc changed
+            | inChar ->
+                let escaped' = c == 0x5C && not escaped -- '\\'
+                    inChar' = escaped || c /= 0x27 -- '\''
+                 in scan buf (i + 1) flushed False inChar' escaped' acc changed
+            | c == 0x22 -> scan buf (i + 1) flushed True False False acc changed -- '"'
+            | c == 0x27 -> scan buf (i + 1) flushed False True False acc changed -- '\''
+            | isIdentStartByte c -> expandIdent buf i flushed acc changed
+            -- A block comment can only open on '{', so the three-byte test
+            -- is gated on that byte rather than run against every byte.
+            | c == 0x7B && startsHsComment buf len i ->
+                -- Copied through verbatim, so there is nothing to flush.
+                scan buf (hsCommentEnd buf i) flushed False False False acc changed
+            | c == 0x2D && i + 1 < len && BS.index buf (i + 1) == 0x2D ->
+                -- Haskell line comment: the rest is not expanded.
+                (acc <> slice buf flushed len, changed)
+            | otherwise ->
+                scan buf (skipDull buf len (i + 1)) flushed False False False acc changed
+      where
+        len = BS.length buf
 
--- | Handle an identifier during blue-paint expansion.
-expandIdentBlue :: EngineState -> Set ByteString -> ByteString -> BSB.Builder -> BSB.Builder
-expandIdentBlue st painted txt acc =
-  let (ident, rest) = C.span isIdentChar txt
-   in if S.member ident painted
-        then -- Blue-painted: copy verbatim, don't expand
-          goText st painted False False False rest (acc <> BSB.byteString ident)
-        else case ident of
-          "__LINE__" ->
-            goText st painted False False False rest (acc <> BSB.string8 (show (stCurrentLine st)))
-          "__FILE__" ->
-            goText st painted False False False rest (acc <> BSB.string8 (show (stCurrentFile st)))
-          _ ->
-            case M.lookup ident (stMacros st) of
-              Just (ObjectMacro replacement) ->
-                let painted' = S.insert ident painted
-                    replacement' = normalizeObjectReplacement replacement
-                    expanded = builderToBytes (goText st painted' False False False replacement' mempty)
-                 in goText st painted False False False rest (acc <> BSB.byteString expanded)
-              Just (FunctionMacro params body) ->
-                case parseCallArgs rest of
-                  Nothing ->
-                    goText st painted False False False rest (acc <> BSB.byteString ident)
-                  Just (args, restAfter)
-                    | length args == length params ->
-                        -- Arguments are expanded in the caller's paint context,
-                        -- before @ident@ is painted, so a nested call to the
-                        -- same macro inside an argument still expands.
-                        let macroArgs = map (macroArg st painted) args
-                            body' = substituteMacroArgs (M.fromList (zip params macroArgs)) body
-                            painted' = S.insert ident painted
-                            expanded = builderToBytes (goText st painted' False False False body' mempty)
-                         in goText st painted False False False restAfter (acc <> BSB.byteString expanded)
-                    | otherwise ->
-                        goText st painted False False False rest (acc <> BSB.byteString ident)
-              Nothing ->
-                goText st painted False False False rest (acc <> BSB.byteString ident)
+    -- \| Handle the identifier starting at @i@.
+    --
+    -- Split in two so that the common case — an identifier that can name
+    -- no macro — allocates nothing. Everything the rare path needs
+    -- (@name@, the painted set, the continuations) would otherwise be a
+    -- thunk built once per identifier in the corpus.
+    expandIdent :: ByteString -> Int -> Int -> BSB.Builder -> Bool -> (BSB.Builder, Bool)
+    expandIdent !buf !i !flushed acc !changed
+      -- No macro name starts with this byte: much the commonest outcome,
+      -- and it costs one bit test rather than a walk of the macro map.
+      | not (bloomMember bloom (BS.index buf i)) =
+          scan buf end flushed False False False acc changed
+      | otherwise = expandNamed buf i end (substr buf i end) flushed acc changed
+      where
+        !end = identEnd buf i
+
+    -- \| Handle an identifier whose first byte a macro name could share.
+    expandNamed :: ByteString -> Int -> Int -> ByteString -> Int -> BSB.Builder -> Bool -> (BSB.Builder, Bool)
+    expandNamed !buf !i !end !name !flushed acc !changed
+      | S.member name painted = verbatim
+      | name == "__LINE__" = replaceWith (BSB.string8 (show (stCurrentLine st)))
+      | name == "__FILE__" = replaceWith (BSB.string8 (show (stCurrentFile st)))
+      | otherwise =
+          case M.lookup name macros of
+            Just (ObjectMacro replacement) ->
+              replaceWith
+                ( BSB.byteString
+                    (expandWith st painted' (normalizeObjectReplacement replacement))
+                )
+            Just (FunctionMacro params body) ->
+              case parseCallArgs (BS.drop end buf) of
+                Just (args, restAfter)
+                  | length args == length params ->
+                      -- Arguments are expanded in the caller's paint context,
+                      -- before @name@ is painted, so a nested call to the
+                      -- same macro inside an argument still expands.
+                      let macroArgs = map (macroArg st painted) args
+                          body' = substituteMacroArgs (M.fromList (zip params macroArgs)) body
+                          expanded = expandWith st painted' body'
+                       in scan
+                            restAfter
+                            0
+                            0
+                            False
+                            False
+                            False
+                            (acc <> slice buf flushed i <> BSB.byteString expanded)
+                            True
+                _ -> verbatim
+            Nothing -> verbatim
+      where
+        painted' = S.insert name painted
+        verbatim = scan buf end flushed False False False acc changed
+        replaceWith b =
+          scan buf end end False False False (acc <> slice buf flushed i <> b) True
+
+-- | The offset just past the identifier starting at @i@.
+identEnd :: ByteString -> Int -> Int
+identEnd buf = go
+  where
+    len = BS.length buf
+    -- The @i < len@ test guards the read on the same line: this is the
+    -- innermost loop of the scan and the bounds check doubled its cost.
+    go !i
+      | i < len && isIdentByte (BSU.unsafeIndex buf i) = go (i + 1)
+      | otherwise = i
+
+-- | Advance past bytes that can neither start an identifier nor open a
+-- literal or a comment, so runs of whitespace, digits and punctuation are
+-- stepped over without re-entering the guard chain per byte.
+skipDull :: ByteString -> Int -> Int -> Int
+skipDull buf len = go
+  where
+    -- The @i < len@ test guards the read on the same line: this is the
+    -- innermost loop of the scan and the bounds check doubled its cost.
+    go !i
+      | i < len && isDullByte (BSU.unsafeIndex buf i) = go (i + 1)
+      | otherwise = i
+
+isDullByte :: Word8 -> Bool
+isDullByte b =
+  not (isIdentStartByte b)
+    && b /= 0x22 -- '"'
+    && b /= 0x27 -- '\''
+    && b /= 0x7B -- '{'
+    && b /= 0x2D -- '-'
+{-# INLINE isDullByte #-}
+
+-- | Given that @buf@ has @{@ at @i@, does a Haskell block comment open
+-- there? @{-#@ is a pragma, not a comment.
+startsHsComment :: ByteString -> Int -> Int -> Bool
+startsHsComment buf len i =
+  i + 1 < len
+    && BS.index buf (i + 1) == 0x2D -- '-'
+    && (i + 2 >= len || BS.index buf (i + 2) /= 0x23) -- '#'
+
+-- | The offset just past the Haskell block comment opening at @i@, or the
+-- end of the buffer if it is never closed.
+hsCommentEnd :: ByteString -> Int -> Int
+hsCommentEnd buf = go (0 :: Int)
+  where
+    len = BS.length buf
+    go :: Int -> Int -> Int
+    go !depth !i
+      | i + 1 >= len = len
+      | b2 == 0x2D && b1 == 0x7B = go (depth + 1) (i + 2) -- '{-'
+      | b2 == 0x7D && b1 == 0x2D = if depth <= 1 then i + 2 else go (depth - 1) (i + 2) -- '-}'
+      | otherwise = go depth (i + 1)
+      where
+        b1 = BS.index buf i
+        b2 = BS.index buf (i + 1)
+
+-- | Byte-level 'isIdentStart'. See 'Aihc.Cpp.Parser.isIdentStart' for why
+-- every byte >= 0x80 qualifies.
+isIdentStartByte :: Word8 -> Bool
+isIdentStartByte b =
+  b == 0x5F -- '_'
+    || (b >= 0x41 && b <= 0x5A) -- 'A'-'Z'
+    || (b >= 0x61 && b <= 0x7A) -- 'a'-'z'
+    || b >= 0x80
+{-# INLINE isIdentStartByte #-}
+
+-- | Byte-level 'Aihc.Cpp.Parser.isIdentChar'.
+isIdentByte :: Word8 -> Bool
+isIdentByte b = isIdentStartByte b || (b >= 0x30 && b <= 0x39)
+{-# INLINE isIdentByte #-}
+
+-- | The bytes of @buf@ in @[from, to)@, as a zero-copy slice.
+substr :: ByteString -> Int -> Int -> ByteString
+substr buf from to = BS.take (to - from) (BS.drop from buf)
+{-# INLINE substr #-}
+
+slice :: ByteString -> Int -> Int -> BSB.Builder
+slice buf from to
+  | to <= from = mempty
+  | otherwise = BSB.byteString (substr buf from to)
+{-# INLINE slice #-}
 
 -- | A function-like macro argument in both the forms the replacement list
 -- can need: the raw spelling (used by @#@ and @##@, which see arguments
@@ -232,8 +357,7 @@ data MacroArg = MacroArg
 -- | Build a 'MacroArg' by expanding the argument text in the paint context of
 -- the call site.
 macroArg :: EngineState -> Set ByteString -> ByteString -> MacroArg
-macroArg st painted raw =
-  MacroArg raw (builderToBytes (goText st painted False False False raw mempty))
+macroArg st painted raw = MacroArg raw (expandWith st painted raw)
 
 -- | Normalize comments inside object-like macro replacement text while
 -- preserving string and char literals. cpphs replaces @/* ... */@ with spaces
@@ -454,32 +578,24 @@ substituteMacroArgs subs = renderPieces . collapseTokenPastes . collapseStringiz
       PieceRaw "#" : collapseStringizing rest
     collapseStringizing (piece : rest) = piece : collapseStringizing rest
 
+    -- The accumulator is held reversed: appending to the end of a list once
+    -- per piece is quadratic, and a macro body expanded on every line of a
+    -- module makes that the single hottest allocation in the preprocessor.
+    -- Reversed, the piece to the left of a @##@ is just the head.
     collapseTokenPastes :: [Piece] -> [Piece]
     collapseTokenPastes = go []
       where
-        go acc [] = acc
+        go acc [] = reverse acc
         go acc (piece : rest) =
           case piece of
             PiecePaste ->
-              let (accNoSpace, _) = trimTrailingWhitespace acc
+              let accNoSpace = dropWhile isWhitespacePiece acc
                   (leadingSpace, restAfterSpace) = span isWhitespacePiece rest
-               in case (unsnoc accNoSpace, restAfterSpace) of
-                    (Just (accInit, leftPiece), rightPiece : remaining) ->
-                      go (accInit <> [PieceRaw (renderPieceRaw leftPiece <> renderPieceRaw rightPiece)]) remaining
-                    _ -> go (acc <> [PieceRaw "##"] <> leadingSpace) restAfterSpace
-            _ -> go (acc <> [piece]) rest
-
-    trimTrailingWhitespace :: [Piece] -> ([Piece], [Piece])
-    trimTrailingWhitespace pieces =
-      let (trailingRev, restRev) = span isWhitespacePiece (reverse pieces)
-       in (reverse restRev, reverse trailingRev)
-
-    unsnoc :: [a] -> Maybe ([a], a)
-    unsnoc [] = Nothing
-    unsnoc [x] = Just ([], x)
-    unsnoc (x : xs) = do
-      (init', last') <- unsnoc xs
-      pure (x : init', last')
+               in case (accNoSpace, restAfterSpace) of
+                    (leftPiece : accInit, rightPiece : remaining) ->
+                      go (PieceRaw (renderPieceRaw leftPiece <> renderPieceRaw rightPiece) : accInit) remaining
+                    _ -> go (reverse leadingSpace <> (PieceRaw "##" : acc)) restAfterSpace
+            _ -> go (piece : acc) rest
 
     isWhitespacePiece :: Piece -> Bool
     isWhitespacePiece (PieceWhitespace _) = True
