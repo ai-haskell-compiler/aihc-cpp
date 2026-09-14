@@ -24,11 +24,11 @@ times and take medians.
 ```
 tool              ok       errored  crashed  seconds    MiB out    MiB/s
 --------------------------------------------------------------------------
-aihc-cpp          5734     68       0        0.87       71.4       82.8
-hpp               5575     0        227      33.13      64.6       2.2
-cpphs             5773     0        29       4.07       71.0       17.6
-(read only)       5802     0        0        0.11       71.8       624.9
-(read + String)   5802     0        0        0.63       71.8       114.7
+aihc-cpp          5734     68       0        1.66       71.4       43.4
+hpp               5575     0        227      84.96      64.6       0.8
+cpphs             5773     0        29       8.88       71.0       8.1
+(read only)       5802     0        0        0.15       71.8       476.3
+(read + String)   5802     0        0        1.05       71.8       68.3
 ```
 <!-- AUTO-GENERATED: END stackage-sweep -->
 
