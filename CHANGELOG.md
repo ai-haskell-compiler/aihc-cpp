@@ -4,6 +4,17 @@ All notable changes to `aihc-cpp` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [2.0.0.1] - 2026-11-15
+
+### Fixed
+
+- A string literal whose line ends in a single unpaired backslash, continued
+  on the next line without a closing string-gap backslash, is now spliced the
+  way GCC does: the backslash and newline are removed and the two lines join.
+  Previously the backslash was left in place, which broke modules such as
+  `streamly-core`. A line whose continuation starts with a backslash is still
+  kept as a Haskell string gap.
+
 ## [2.0.0.0] - 2026-09-10
 
 ### Performance
