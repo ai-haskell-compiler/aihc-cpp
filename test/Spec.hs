@@ -285,6 +285,10 @@ stringContinuationTests =
         assertPreprocessOutput
           ghcStringGapInput
           (C.unlines ["#line 1 \"<input>\"", "x = \"a\\", "       \\b\""]),
+      testCase "ordinary string splices single backslash with no gap close" $
+        assertPreprocessOutput
+          singleBackslashSpliceInput
+          (C.unlines ["#line 1 \"<input>\"", "x = \"a       b\""]),
       testCase "function macro argument accepts GCC double-backslash continuation" $
         assertPreprocessOutput
           gccStringContinuationMacroInput
@@ -523,6 +527,13 @@ ghcStringGapInput =
   C.unlines
     [ "x = \"a\\",
       "       \\b\""
+    ]
+
+singleBackslashSpliceInput :: BS.ByteString
+singleBackslashSpliceInput =
+  C.unlines
+    [ "x = \"a\\",
+      "       b\""
     ]
 
 gccStringContinuationMacroInput :: BS.ByteString
