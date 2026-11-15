@@ -257,7 +257,7 @@ nextLine cur =
           joinContinuationLines cur lineStart lineEnd rest
         else
           let lineText = sliceBytes lineStart lineEnd cur
-           in if hasGccStringContinuation emptyQuoteState lineText
+           in if hasStringContinuation emptyQuoteState lineText rest
                 then joinStringContinuationLines cur lineStart lineEnd rest
                 else (lineText, 1, rest)
 
@@ -332,6 +332,28 @@ hasGccStringContinuation :: QuoteState -> ByteString -> Bool
 hasGccStringContinuation st lineText =
   "\\\\" `C.isSuffixOf` lineText && qsInString (scanQuoteState st lineText)
 
+-- | Tell if a line continues on the next physical line inside a string.
+--
+-- The double-backslash spelling is 'hasGccStringContinuation'.  A line can
+-- also end in one unpaired backslash inside a string.  If the next line
+-- starts with a backslash after blanks, the pair is a Haskell string gap and
+-- stays.  Otherwise the backslash is only the CPP continuation marker, so GCC
+-- removes it with the newline.  For example, streamly-core writes
+-- @\"an \\@ and continues the string on the next line with no gap close.
+hasStringContinuation :: QuoteState -> ByteString -> Cursor -> Bool
+hasStringContinuation st lineText next =
+  "\\" `C.isSuffixOf` lineText
+    && ( hasGccStringContinuation st lineText
+           || ( let end = scanQuoteState st lineText
+                 in qsInString end
+                      && qsEscaped end
+                      && not (atEnd next)
+                      && peekByte (skipWhile isSpaceOrTab next) /= Just 0x5C -- '\'
+              )
+       )
+  where
+    isSpaceOrTab b = b == 0x20 || b == 0x09
+
 joinStringContinuationLines :: Cursor -> Int -> Int -> Cursor -> (ByteString, Int, Cursor)
 joinStringContinuationLines origCur lineStart firstLineEnd firstRest =
   let buf = curBuf origCur
@@ -349,7 +371,7 @@ joinStringContinuationLines origCur lineStart firstLineEnd firstRest =
               segEnd = curPos eol
               rest' = fromMaybe eol (skipNewline eol)
               segmentText = sliceBytes segStart segEnd origCur
-           in if hasGccStringContinuation quoteState segmentText
+           in if hasStringContinuation quoteState segmentText rest'
                 then
                   let segmentBytes = BSB.byteString (sliceBS segStart (segEnd - 1) (curBuf origCur))
                       scannedText = sliceBytes segStart (segEnd - 1) origCur
