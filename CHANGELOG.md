@@ -4,6 +4,18 @@ All notable changes to `aihc-cpp` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- A directive inside a Haskell block comment (`{- ... -}`) is now live, as
+  it is with GHC. GHC runs the system C preprocessor, which does not know
+  Haskell comments. Previously such a directive was ignored, which broke
+  modules such as `streamly-core`, that define macros in a `{- ... -}`
+  comment. A directive inside a C block comment (`/* ... */`) is still
+  ignored. This behavior deliberately differs from `cpphs`, thus the two
+  `cpphs` oracle fixtures for directives in a Haskell comment are removed.
+
 ## [2.0.0.1] - 2026-11-15
 
 ### Fixed

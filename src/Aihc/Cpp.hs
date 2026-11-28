@@ -432,9 +432,13 @@ processFile filePath cursor trailingNl stack !lineNo st k =
       hasTrailingNl = trailingNl && not (atEnd restCursor) || (trailingNl && atEnd restCursor)
       -- Actually: trailingNl flag is set at processFile entry for includes.
       -- We just propagate it. The check at atEnd above handles the final empty line.
-      startsInBlockComment = stHsBlockCommentDepth st > 0 || stCBlockCommentDepth st > 0
+      -- Only a C block comment hides a directive. GHC runs the system C
+      -- preprocessor, which does not know Haskell comments. Thus a directive
+      -- inside @{- ... -}@ is live, and real modules depend on it (for
+      -- example, streamly-core defines its mode constants in such a comment).
+      startsInCBlockComment = stCBlockCommentDepth st > 0
       parsedDirective =
-        if startsInBlockComment
+        if startsInCBlockComment
           then Nothing
           else parseDirective lineText
       isActive = currentActive stack

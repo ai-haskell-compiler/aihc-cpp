@@ -26,10 +26,8 @@ line-directive-file-and-number	diagnostics	line-directive-file-and-number.hs	pas
 line-directive-number-only	diagnostics	line-directive-number-only.hs	pass
 language-pragma-closing-line	lexing	language-pragma-closing-line.hs	pass
 indented-hash-operator	lexing	indented-hash-operator.hs	pass
-macro-in-comment	lexing	macro-in-comment.hs	pass
 macro-in-inline-block-comment	lexing	macro-in-inline-block-comment.hs	pass
 macro-in-line-comment	lexing	macro-in-line-comment.hs	pass
-macro-in-comment-with-line-comment-marker	lexing	macro-in-comment-with-line-comment-marker.hs	pass
 unterminated-string-in-comment	lexing	unterminated-string-in-comment.hs	pass
 comment-stripping-c89	lexing	comment-stripping-c89.hs	pass
 predefined-in-string	macro	predefined-in-string.hs	pass
