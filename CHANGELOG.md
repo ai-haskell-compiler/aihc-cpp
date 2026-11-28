@@ -13,8 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Haskell comments. Previously such a directive was ignored, which broke
   modules such as `streamly-core`, that define macros in a `{- ... -}`
   comment. A directive inside a C block comment (`/* ... */`) is still
-  ignored. Two oracle fixtures are now marked `xfail`, because `cpphs`
-  ignores these directives.
+  ignored. This behavior deliberately differs from `cpphs`, thus the two
+  `cpphs` oracle fixtures for directives in a Haskell comment are removed.
 
 ## [2.0.0.1] - 2026-11-15
 
