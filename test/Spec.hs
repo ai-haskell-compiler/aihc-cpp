@@ -411,24 +411,30 @@ macroRescanTests =
           (C.unlines ["#line 1 \"<input>\"", "", "", "h = (3) + ((3))"])
     ]
 
+-- | GHC runs the system C preprocessor, which does not know Haskell
+-- comments. Thus a directive inside @{- ... -}@ is live. Each expected
+-- output is the output of @ghc -E -cpp@ for the same input.
 pragmaInsideBlockCommentTests :: TestTree
 pragmaInsideBlockCommentTests =
   testGroup
-    "pragma inside a Haskell block comment"
-    [ testCase "#-} does not close the enclosing comment" $
+    "directive inside a Haskell block comment"
+    [ testCase "#define inside a comment defines the macro" $
+        assertPreprocessOutput
+          (C.unlines ["{-", "#define S_IXUSR 00100", "-}", "x = S_IXUSR"])
+          (C.unlines ["#line 1 \"<input>\"", "{-", "", "-}", "x = 00100"]),
+      testCase "#if 0 inside a comment removes its lines" $
         case preprocess defaultConfig pragmaInBlockCommentInput of
           Done result -> do
             resultDiagnostics result @?= []
             resultOutput result
-              @?= "#line 1 \"<input>\"\n{-\n#if 0\n{-# INLINABLE foo #-}\n#endif\n-}\nlive\n"
+              @?= "#line 1 \"<input>\"\n{-\n\n\n\n-}\nlive\n"
           _ -> assertFailure "expected Done",
-      testCase "commented-out #if 0 does not delete live code" $
+      testCase "a pragma inside a comment does not stop the next directives" $
         case preprocess defaultConfig pragmaInBlockCommentElseInput of
           Done result -> do
             resultDiagnostics result @?= []
-            if "kept" `C.isInfixOf` resultOutput result
-              then pure ()
-              else assertFailure ("expected commented-out branch to stay intact, got: " <> show (resultOutput result))
+            resultOutput result
+              @?= "#line 1 \"<input>\"\n{-\n{-# INLINABLE foo #-}\n\n\n\nalso kept\n\n-}\nlive\n"
           _ -> assertFailure "expected Done"
     ]
 
